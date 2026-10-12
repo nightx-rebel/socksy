@@ -1,0 +1,22 @@
+{
+  "name": "wa-multi-socket-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.2.1",
+    "wa-multi-socket": "file:.."
+  },
+  "devDependencies": {
+    "supertest": "^7.1.4"
+  }
+}
