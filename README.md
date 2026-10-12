@@ -41,7 +41,8 @@
 - Pair new accounts with a phone number and pairing code.
 - Persist credentials and binary Signal keys in local SQLite or PostgreSQL.
 - Restore saved accounts automatically with `manager.start()`.
-- Configure reconnect delays by Baileys `DisconnectReason`.
+- Bound simultaneous handshakes and pairing requests to avoid startup spikes.
+- Retry transient disconnects with capped exponential backoff and jitter.
 - Receive manager lifecycle events for connect, disconnect, pairing, logout, and errors.
 - Disconnect a user temporarily or remove their saved authentication completely.
 
@@ -314,6 +315,25 @@ const manager = new MultiSocketManager({
 
 Set `reconnect: false` to turn off automatic retries. Logout cleanup still happens: the socket is closed and saved auth is deleted. The manager handles socket `close` events and schedules retries itself; your bot does not need to call `connectUser()` from a disconnect handler.
 
+Reconnect delays are initial delays: repeated failures increase the wait exponentially up to `maxReconnectDelayMs` (60 seconds by default), with up to `reconnectJitterMs` (1 second by default) added to spread retry bursts. A successful connection resets that user's backoff. A connection that never opens is closed and treated as a transient failure after `connectionAttemptTimeoutMs` (60 seconds by default).
+
+## ⚖️ Capacity and connection management
+
+The manager limits in-progress handshakes to 20 and pairing-code requests to 5 by default. A handshake slot is held until Baileys reports open/close or the attempt times out. Tune these per server rather than launching hundreds of logins at once:
+
+```ts
+const manager = new MultiSocketManager({
+	authStore: createAuthStore(process.env.DATABASE_URL),
+	maxConcurrentConnections: 12,
+	maxConcurrentPairings: 3,
+	connectionAttemptTimeoutMs: 60_000,
+	reconnectJitterMs: 1_000,
+	maxReconnectDelayMs: 60_000,
+});
+```
+
+These limits control connection and pairing bursts; they do not cap the number of established sockets. Baileys retains per-account protocol state, so no library setting can promise that a particular CPU/RAM/network budget will sustain 600–700 accounts. Load-test with representative message traffic and monitor RSS, event-loop delay, database latency, file descriptors, and network usage before setting production capacity. Use PostgreSQL for a multi-instance or high-write deployment; the built-in SQLite adapter is synchronous and best suited to a single host. For larger deployments, shard accounts across manager processes, keep one owner per account, and send application events to bounded queues so slow bot handlers cannot retain unbounded work.
+
 ## 🗄️ Database and auth storage
 
 ### Local SQLite
@@ -364,7 +384,9 @@ The PostgreSQL adapter creates a `wa_auth` table if needed. For another SQL driv
 | `getUserIds()` | Return IDs for currently managed sockets. |
 | `disconnectUser(userId)` | Close the socket and keep saved auth. |
 | `removeUser(userId)` | Close the socket and delete all auth records for that user. |
-| `close()` | Close managed sockets and the auth store; keep saved auth for the next start. |
+| `close()` | Close managed sockets and the auth store; keep saved auth for a future manager instance. |
+
+`maxConcurrentConnections`, `maxConcurrentPairings`, `connectionAttemptTimeoutMs`, `reconnectJitterMs`, and `maxReconnectDelayMs` configure the corresponding limits described above.
 
 After a real `loggedOut` disconnect, the auth records are deleted. Calling `addUser()` again with the same ID creates a fresh auth state that can be paired again.
 
@@ -372,6 +394,7 @@ After a real `loggedOut` disconnect, the auth records are deleted. Calling `addU
 
 - Auth storage contains WhatsApp credentials and cryptographic Signal keys. Restrict database access and keep `DATABASE_URL` secret. This package does not encrypt stored data at rest.
 - Run one manager process per `userId`. If multiple application instances may manage the same account, add distributed locking or another ownership mechanism.
+- For 600–700 concurrent accounts, benchmark on the intended host and shard accounts across processes/hosts as needed. Connection limits smooth session startup; they are not a guarantee of the hardware capacity or a limit on established socket memory.
 - Call `manager.close()` during graceful shutdown. It closes sockets and the database handle/pool without deleting saved auth.
 - `disconnectUser()` is temporary and keeps auth. `removeUser()` deletes stored auth. A WhatsApp `loggedOut` disconnect always deletes auth and is never retried.
 - `manager.events` uses Node's `EventEmitter`. Exceptions thrown by your listeners can propagate through the event flow; handle errors inside application listeners.

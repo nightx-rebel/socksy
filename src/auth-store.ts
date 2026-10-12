@@ -10,6 +10,7 @@ export type AuthRecord = {
 
 export interface AuthStore {
   get(userId: string, key: string): Promise<string | undefined>;
+  getMany?(userId: string, keys: string[]): Promise<Map<string, string>>;
   setMany(userId: string, records: AuthRecord[]): Promise<void>;
   deleteKeys(userId: string, prefix: string): Promise<void>;
   deleteUser(userId: string): Promise<void>;
@@ -24,6 +25,7 @@ export class SQLiteAuthStore implements AuthStore {
     const path = filename === ':memory:' ? filename : resolve(filename);
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.database = new DatabaseSync(path);
+    this.database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS wa_auth (
         user_id TEXT NOT NULL,
@@ -41,7 +43,19 @@ export class SQLiteAuthStore implements AuthStore {
     return row?.value;
   }
 
+  async getMany(userId: string, keys: string[]): Promise<Map<string, string>> {
+    if (keys.length === 0) return new Map();
+    const placeholders = keys.map(() => '?').join(', ');
+    const rows = this.database
+      .prepare(
+        `SELECT record_key, value FROM wa_auth WHERE user_id = ? AND record_key IN (${placeholders})`,
+      )
+      .all(userId, ...keys) as { record_key: string; value: string }[];
+    return new Map(rows.map((row) => [row.record_key, row.value]));
+  }
+
   async setMany(userId: string, records: AuthRecord[]): Promise<void> {
+    if (records.length === 0) return;
     const insert = this.database.prepare(
       'INSERT INTO wa_auth (user_id, record_key, value) VALUES (?, ?, ?) ON CONFLICT(user_id, record_key) DO UPDATE SET value = excluded.value',
     );
@@ -104,7 +118,6 @@ export class PostgresAuthStore implements AuthStore {
 
   private async ready(): Promise<void> {
     await this.initialization;
-    await this.pool.query('SELECT 1');
   }
 
   async get(userId: string, key: string): Promise<string | undefined> {
@@ -116,23 +129,42 @@ export class PostgresAuthStore implements AuthStore {
     return result.rows[0]?.value;
   }
 
+  async getMany(userId: string, keys: string[]): Promise<Map<string, string>> {
+    await this.ready();
+    if (keys.length === 0) return new Map();
+    const result = await this.pool.query<{ record_key: string; value: string }>(
+      'SELECT record_key, value FROM wa_auth WHERE user_id = $1 AND record_key = ANY($2::text[])',
+      [userId, keys],
+    );
+    return new Map(result.rows.map((row) => [row.record_key, row.value]));
+  }
+
   async setMany(userId: string, records: AuthRecord[]): Promise<void> {
+    if (records.length === 0) return;
     await this.ready();
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      for (const record of records) {
-        if (record.value === null) {
-          await client.query(
-            'DELETE FROM wa_auth WHERE user_id = $1 AND record_key = $2',
-            [userId, record.key],
-          );
-        } else {
-          await client.query(
-            'INSERT INTO wa_auth (user_id, record_key, value) VALUES ($1, $2, $3) ON CONFLICT (user_id, record_key) DO UPDATE SET value = EXCLUDED.value',
-            [userId, record.key, record.value],
-          );
-        }
+      const upserts = records.filter(
+        (record): record is AuthRecord & { value: string } => record.value !== null,
+      );
+      const deletions = records
+        .filter((record) => record.value === null)
+        .map((record) => record.key);
+      if (upserts.length > 0) {
+        await client.query(
+          `INSERT INTO wa_auth (user_id, record_key, value)
+           SELECT $1, record_key, value
+           FROM UNNEST($2::text[], $3::text[]) AS records(record_key, value)
+           ON CONFLICT (user_id, record_key) DO UPDATE SET value = EXCLUDED.value`,
+          [userId, upserts.map((record) => record.key), upserts.map((record) => record.value)],
+        );
+      }
+      if (deletions.length > 0) {
+        await client.query(
+          'DELETE FROM wa_auth WHERE user_id = $1 AND record_key = ANY($2::text[])',
+          [userId, deletions],
+        );
       }
       await client.query('COMMIT');
     } catch (error) {

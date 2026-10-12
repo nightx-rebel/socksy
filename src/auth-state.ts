@@ -54,13 +54,21 @@ export async function loadAuthState(
 
   const keys: SignalKeyStore = {
     get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
-      const entries = await Promise.all(
-        ids.map(async (id) => [id, await store.get(userId, `key:${type}:${id}`)] as const),
-      );
+      const recordKeys = ids.map((id) => `key:${type}:${id}`);
+      const stored = store.getMany
+        ? await store.getMany(userId, recordKeys)
+        : new Map(
+            (
+              await Promise.all(
+                recordKeys.map(async (key) => [key, await store.get(userId, key)] as const),
+              )
+            ).filter((entry): entry is readonly [string, string] => entry[1] !== undefined),
+          );
       const result: Record<string, SignalDataTypeMap[T]> = {};
-      for (const [id, value] of entries) {
+      ids.forEach((id, index) => {
+        const value = stored.get(recordKeys[index]!);
         if (value !== undefined) result[id] = deserialize<SignalDataTypeMap[T]>(value);
-      }
+      });
       return result;
     },
     set: async (data: SignalDataSet) => {
