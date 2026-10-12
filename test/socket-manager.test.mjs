@@ -42,12 +42,17 @@ test('pairs users and reconnects with the configured delay', async () => {
     },
   });
 
-  const { socket, pairingCode } = await manager.addUser('user-1', {
+  const addingUser = manager.addUser('user-1', {
     phoneNumber: '+1 (555) 123-4567',
   });
+  await new Promise((resolve) => setImmediate(resolve));
+  const socket = manager.getSocket('user-1');
+  assert.ok(socket);
+  assert.equal(socket.pairingRequest, undefined);
+  socket.ev.emit('connection.update', { qr: 'server-ready' });
+  const { pairingCode } = await addingUser;
   assert.equal(pairingCode, 'ABCD-EFGH');
   assert.deepEqual(socket.pairingRequest, { phoneNumber: '15551234567', customCode: undefined });
-  assert.equal(manager.getSocket('user-1'), socket);
 
   const reconnecting = once(manager.events, 'user:reconnecting');
   const nextConnecting = once(manager.events, 'user:connecting');
@@ -126,6 +131,7 @@ test('rejects duplicate pairing requests for one user', async () => {
     manager.requestPairingCode('user-pairing', '+1 555 123 4567'),
     /already in progress/,
   );
+  manager.getSocket('user-pairing').ev.emit('connection.update', { qr: 'server-ready' });
   assert.equal(await first, 'ABCD-EFGH');
   await manager.close();
 });

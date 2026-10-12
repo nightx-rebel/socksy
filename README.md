@@ -250,7 +250,7 @@ Or request it separately for an unregistered account:
 const code = await manager.requestPairingCode('tenant-a', '15551234567');
 ```
 
-If credentials are already registered, `addUser()` connects the existing account and does not return a new pairing code. `requestPairingCode()` throws if the account is already registered. The account owner enters the code in WhatsApp's Linked devices flow.
+If credentials are already registered, `addUser()` connects the existing account and does not return a new pairing code. For an unregistered account, pairing-code requests wait until Baileys receives WhatsApp's initial pairing response before sending the request. `requestPairingCode()` throws if the account is already registered. The account owner enters the code in WhatsApp's Linked devices flow.
 
 ## 📣 Events
 

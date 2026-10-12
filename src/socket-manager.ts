@@ -35,8 +35,10 @@ type ManagedSocket = {
   socket: WASocket;
   connectionTimer: NodeJS.Timeout;
   releaseConnectionSlot: () => void;
+  pairingReadyWaiters: Set<{ resolve: () => void; reject: (error: Error) => void }>;
   closed: boolean;
   hasConnected: boolean;
+  pairingReady: boolean;
 };
 
 class AsyncLimiter {
@@ -238,8 +240,10 @@ export class MultiSocketManager {
           void this.handleDisconnect(userId, entry, new Error('Connection attempt timed out.'));
         }, this.options.connectionAttemptTimeoutMs ?? 60_000),
         releaseConnectionSlot,
+        pairingReadyWaiters: new Set(),
         closed: false,
         hasConnected: false,
+        pairingReady: false,
       };
       this.sockets.set(userId, entry);
 
@@ -252,6 +256,14 @@ export class MultiSocketManager {
 
       socket.ev.on('connection.update', (update) => {
         this.emit('baileys:connection.update', { userId, socket, update });
+        if (
+          !entry.pairingReady &&
+          (update.connection === 'open' || (typeof update.qr === 'string' && update.qr.length > 0))
+        ) {
+          entry.pairingReady = true;
+          for (const waiter of entry.pairingReadyWaiters) waiter.resolve();
+          entry.pairingReadyWaiters.clear();
+        }
         if (update.connection === 'open' && !entry.closed && !entry.hasConnected) {
           clearTimeout(entry.connectionTimer);
           entry.releaseConnectionSlot();
@@ -279,6 +291,7 @@ export class MultiSocketManager {
   ): Promise<void> {
     if (this.sockets.get(userId) !== entry || entry.closed) return;
     entry.closed = true;
+    this.rejectPairingReadyWaiters(entry, error);
     clearTimeout(entry.connectionTimer);
     entry.releaseConnectionSlot();
     const reason = this.getDisconnectReason(error);
@@ -347,6 +360,7 @@ export class MultiSocketManager {
     try {
       const release = await this.pairingLimiter.acquire();
       try {
+        await this.waitForPairingReady(userId, socket);
         const code = await socket.requestPairingCode(normalizedPhoneNumber, customCode);
         this.emit('user:pairing-code', { userId, pairingCode: code });
         return code;
@@ -356,6 +370,42 @@ export class MultiSocketManager {
     } finally {
       this.pairingUsers.delete(userId);
     }
+  }
+
+  private waitForPairingReady(userId: string, socket: WASocket): Promise<void> {
+    const entry = this.sockets.get(userId);
+    if (!entry || entry.socket !== socket || entry.closed) {
+      return Promise.reject(new Error(`Socket for user "${userId}" is not available for pairing.`));
+    }
+    if (entry.pairingReady) return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+      let timer: NodeJS.Timeout;
+      const waiter = {
+        resolve: () => {
+          clearTimeout(timer);
+          entry.pairingReadyWaiters.delete(waiter);
+          resolve();
+        },
+        reject: (error: Error) => {
+          clearTimeout(timer);
+          entry.pairingReadyWaiters.delete(waiter);
+          reject(error);
+        },
+      };
+      timer = setTimeout(() => {
+        waiter.reject(new Error(`Timed out waiting for WhatsApp to initialize pairing for user "${userId}".`));
+      }, this.options.connectionAttemptTimeoutMs ?? 60_000);
+      entry.pairingReadyWaiters.add(waiter);
+    });
+  }
+
+  private rejectPairingReadyWaiters(entry: ManagedSocket, error: unknown): void {
+    const reason = error instanceof Error
+      ? error
+      : new Error('Socket disconnected before WhatsApp initialized pairing.');
+    for (const waiter of entry.pairingReadyWaiters) waiter.reject(reason);
+    entry.pairingReadyWaiters.clear();
   }
 
   private getDisconnectReason(error: unknown): DisconnectReason | undefined {
@@ -387,6 +437,7 @@ export class MultiSocketManager {
     if (entry) {
       const wasOpen = !entry.closed;
       entry.closed = true;
+      this.rejectPairingReadyWaiters(entry, new Error('Socket was stopped before pairing completed.'));
       clearTimeout(entry.connectionTimer);
       entry.releaseConnectionSlot();
       if (wasOpen) {
