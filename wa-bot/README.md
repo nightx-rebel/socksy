@@ -2,16 +2,20 @@
 
 An Express app that uses the sibling `wa-multi-socket` project for WhatsApp sessions, pairing codes, auth persistence, and reconnects. It includes a bounded plugin dispatcher and `!ping`, `!echo`, and `!help` examples.
 
-## Run
+## Install and run
 
-Requires Node.js 22.13 or newer. From this folder:
+Requires Node.js 22.13 or newer. From the repository root, install and build the library first, then install the bot dependencies:
 
 ```sh
-npm install
+npm ci
+npm run build
+cd wa-bot
+npm ci
 cp .env.example .env
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-Set `BOT_API_TOKEN` in `.env` to a long random secret, then start the app:
+Copy the generated value into `BOT_API_TOKEN` in `.env`. Keep the token private. Start the app from the `wa-bot` directory:
 
 ```sh
 npm start
@@ -27,6 +31,36 @@ curl -H 'Authorization: Bearer YOUR_BOT_API_TOKEN' \
 ```
 
 The optional `userId` query parameter lets an application use its own stable account ID. The default ID is the normalized phone number. Pairing codes are sensitive; use HTTPS, keep the API token private, and do not log API query strings or response bodies at a reverse proxy.
+
+## Test a real WhatsApp pairing
+
+The route tests below use a mock socket. To test against WhatsApp itself, use a phone number for an account you own and keep the bot running during the entire pairing attempt.
+
+1. Set a private `BOT_API_TOKEN` in `.env` and start the bot from this directory with `npm start`.
+2. In a second terminal, change to the `wa-bot` directory and request a pairing code. Replace the token and example number with your own values; include the country code and do not include a leading `+`:
+
+   ```sh
+   cd wa-bot
+   curl --get 'http://localhost:3000/pair' \
+     -H 'Authorization: Bearer YOUR_BOT_API_TOKEN' \
+     --data-urlencode 'number=14155550123'
+   ```
+
+   You can optionally pass a stable account ID with `--data-urlencode 'userId=my-account'`. The default ID is the normalized phone number.
+3. A successful response contains a `pairingCode`, for example `{"userId":"14155550123","pairingCode":"ABCD1234"}`. On your phone, open WhatsApp → **Linked devices** → **Link a device** → **Link with phone number instead**, then enter the code promptly. Menu wording may differ by WhatsApp version.
+4. Wait for WhatsApp to finish linking and watch the bot terminal for errors. Receiving an API response with a code only means the code request succeeded; it does not prove that the account linked. Pairing codes expire, so request a new one if the attempt times out.
+
+Never use a random or someone else's number. Do not share the pairing code, `.env`, or the auth database. The database is stored at `wa-bot/data/wa-auth.sqlite`, contains WhatsApp credentials and Signal keys, and is ignored by Git.
+
+After linking, test the included plugins by sending `!ping`, `!help`, or `!echo hello` to the linked account from a different WhatsApp account. The bot should reply. The sample plugins ignore messages sent by the linked account itself. Saved auth is restored on the next start; press `Ctrl+C` to stop the bot gracefully.
+
+Check that the HTTP API is responding with:
+
+```sh
+curl http://localhost:3000/healthz
+```
+
+It should return `{"status":"ok"}`. A successful health check confirms only that the API is running, not that WhatsApp is connected.
 
 ## Plugins
 

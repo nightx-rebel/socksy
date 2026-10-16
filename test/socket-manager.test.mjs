@@ -51,8 +51,8 @@ test('pairs users and reconnects with the configured delay', async () => {
   assert.equal(socket.pairingRequest, undefined);
   socket.ev.emit('connection.update', { qr: 'server-ready' });
   const { pairingCode } = await addingUser;
-  assert.equal(pairingCode, 'ABCD-EFGH');
   assert.deepEqual(socket.pairingRequest, { phoneNumber: '15551234567', customCode: undefined });
+  assert.equal(pairingCode, 'ABCD-EFGH');
 
   const reconnecting = once(manager.events, 'user:reconnecting');
   const nextConnecting = once(manager.events, 'user:connecting');
@@ -68,6 +68,29 @@ test('pairs users and reconnects with the configured delay', async () => {
   const connected = once(manager.events, 'user:connected');
   reconnectedSocket.ev.emit('connection.update', { connection: 'open' });
   assert.equal((await connected)[0].reconnecting, true);
+  await manager.close();
+});
+
+test('returns a pairing code for a random 12-digit phone number', async () => {
+  const manager = new MultiSocketManager({
+    authStore: new SQLiteAuthStore(':memory:'),
+    socketFactory: (config) => new FakeSocket(config),
+  });
+  const phoneNumber = String(Math.floor(100_000_000_000 + Math.random() * 900_000_000_000));
+  const pairingCodeEvent = once(manager.events, 'user:pairing-code');
+
+  const addingUser = manager.addUser('user-random-phone', { phoneNumber });
+  await new Promise((resolve) => setImmediate(resolve));
+  const socket = manager.getSocket('user-random-phone');
+  assert.ok(socket);
+  assert.equal(socket.pairingRequest, undefined);
+  socket.ev.emit('connection.update', { qr: 'server-ready' });
+  const { pairingCode } = await addingUser;
+
+  assert.match(phoneNumber, /^\d{12}$/);
+  assert.deepEqual(socket.pairingRequest, { phoneNumber, customCode: undefined });
+  assert.equal(pairingCode, 'ABCD-EFGH');
+  assert.deepEqual(await pairingCodeEvent, [{ userId: 'user-random-phone', pairingCode: 'ABCD-EFGH' }]);
   await manager.close();
 });
 
@@ -126,12 +149,21 @@ test('rejects duplicate pairing requests for one user', async () => {
   });
   await manager.connectUser('user-pairing');
 
+  let resolvePairing;
+  const socket = manager.getSocket('user-pairing');
+  socket.requestPairingCode = async () =>
+    new Promise((resolve) => {
+      resolvePairing = resolve;
+    });
   const first = manager.requestPairingCode('user-pairing', '+1 555 123 4567');
+  await new Promise((resolve) => setImmediate(resolve));
   await assert.rejects(
     manager.requestPairingCode('user-pairing', '+1 555 123 4567'),
     /already in progress/,
   );
-  manager.getSocket('user-pairing').ev.emit('connection.update', { qr: 'server-ready' });
+  socket.ev.emit('connection.update', { qr: 'server-ready' });
+  await new Promise((resolve) => setImmediate(resolve));
+  resolvePairing('ABCD-EFGH');
   assert.equal(await first, 'ABCD-EFGH');
   await manager.close();
 });
