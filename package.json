@@ -15,16 +15,21 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "npm run build && node --test"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc14",
     "@hapi/boom": "^10.0.1",
-    "pg": "^8.16.3"
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "chalk": "^6.0.1",
+    "pg": "^8.16.3",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",
