@@ -2,11 +2,17 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import request from 'supertest';
+import { WaManagerError } from 'wa-multi-socket';
 import { assertSecureHost, createServer } from '../src/server.js';
 
 const token = 'test-token-value';
 
-function makeApp(addUser = async () => ({ pairingCode: 'ABCD-EFGH' }), apiKey = token, initialUserIds = []) {
+function makeApp(
+  addUser = async () => ({ pairingCode: 'ABCD-EFGH' }),
+  apiKey = token,
+  initialUserIds = [],
+  overrides = {},
+) {
   const calls = [];
   const manager = {
     events: new EventEmitter(),
@@ -18,9 +24,15 @@ function makeApp(addUser = async () => ({ pairingCode: 'ABCD-EFGH' }), apiKey = 
     getStatus: () => 'offline',
     getStats: () => ({ total: 0, open: 0, connecting: 0, awaitingPairing: 0, reconnecting: 0 }),
     getConnectedSocket: () => undefined,
-    sendMessage: async () => {
+    connectUser: async (userId) => calls.push(['connect', userId]),
+    disconnectUser: async (userId) => calls.push(['disconnect', userId]),
+    logoutUser: async (userId) => calls.push(['logout', userId]),
+    removeUser: async (userId) => calls.push(['remove', userId]),
+    sendMessage: async (...args) => {
+      calls.push(['send', ...args]);
       throw new Error('private internal detail');
     },
+    ...overrides,
   };
   return { app: createServer({ manager, apiKey, pairingWindowMs: 180_000 }), calls, manager };
 }
@@ -58,6 +70,63 @@ test('pair endpoint accepts the x-api-key header', async () => {
   assert.equal(response.status, 200);
   assert.equal(response.headers['cache-control'], 'no-store');
   assert.equal(calls.length, 1);
+});
+
+test('pair endpoint maps invalid phone errors to a client error', async () => {
+  const { app } = makeApp(async () => {
+    throw new WaManagerError('INVALID_ARGUMENT', 'invalid phone');
+  });
+  const response = await request(app)
+    .get('/pair')
+    .set('x-api-key', token)
+    .query({ number: '123' });
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.error, 'INVALID_ARGUMENT');
+});
+
+test('account and send routes call the correct manager operations', async () => {
+  const { app, calls } = makeApp(
+    undefined,
+    token,
+    ['user-1'],
+    {
+      getStatus: () => 'open',
+      getConnectedSocket: () => ({ user: { id: '15551234567@s.whatsapp.net' } }),
+      sendMessage: async (...args) => {
+        calls.push(['send', ...args]);
+        return { key: { id: 'message-1' } };
+      },
+    },
+  );
+  const auth = (requestBuilder) => requestBuilder.set('x-api-key', token);
+
+  const details = await auth(request(app).get('/users/user-1'));
+  assert.deepEqual(details.body, {
+    ok: true,
+    userId: 'user-1',
+    status: 'open',
+    account: '15551234567@s.whatsapp.net',
+  });
+  assert.equal((await auth(request(app).post('/users/user-1/connect'))).status, 200);
+  assert.equal((await auth(request(app).post('/users/user-1/disconnect'))).status, 200);
+  assert.equal((await auth(request(app).post('/users/user-1/logout'))).status, 200);
+  assert.equal((await auth(request(app).delete('/users/user-1'))).status, 200);
+
+  const sent = await auth(request(app).post('/send')).send({
+    userId: 'user-1',
+    to: '+1 (555) 123-4567',
+    text: 'hello',
+  });
+  assert.equal(sent.status, 200);
+  assert.equal(sent.body.messageId, 'message-1');
+  assert.deepEqual(calls, [
+    ['connect', 'user-1'],
+    ['disconnect', 'user-1'],
+    ['logout', 'user-1'],
+    ['remove', 'user-1'],
+    ['send', 'user-1', '15551234567@s.whatsapp.net', { text: 'hello' }],
+  ]);
 });
 
 test('health endpoint is public and does not expose account details', async () => {

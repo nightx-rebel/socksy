@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { commandMap } from '../src/commands.js';
+import { isDebug, setDebug } from '../src/logger.js';
 
 function makeContext(rawArgs = '') {
   const sent = [];
@@ -31,4 +32,14 @@ test('example commands provide help and echo without a live socket', async () =>
 
 test('raw message inspection is restricted to owners', () => {
   assert.equal(commandMap.get('raw').ownerOnly, true);
+});
+
+test('debug command changes the live logging state', async () => {
+  const context = makeContext();
+  setDebug(false);
+  await commandMap.get('debug').run({ ...context.context, args: ['on'] });
+  assert.equal(isDebug(), true);
+
+  await commandMap.get('debug').run({ ...context.context, args: ['off'] });
+  assert.equal(isDebug(), false);
 });

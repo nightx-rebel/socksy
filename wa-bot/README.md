@@ -59,7 +59,7 @@ The API key can be sent as `Authorization: Bearer <token>` or `x-api-key: <token
 
 ## Auth storage and operations
 
-The default database is local SQLite at `wa-bot/data/wa-auth.sqlite`, with owner-only file permissions. For a shared production database, set `DATABASE_URL` to a PostgreSQL connection URL. Optionally set `AUTH_ENCRYPTION_KEY` to a 32-byte key (64 hex characters or base64) to encrypt auth values at rest. Keep database backups and encryption keys private. Never commit the database, `.env`, pairing codes, or auth credentials.
+The default database is local SQLite at `wa-bot/data/wa-auth.sqlite`; startup fails if the library cannot restrict the database file to its owner. For a shared production database, set `DATABASE_URL` to a PostgreSQL connection URL. Optionally set `AUTH_ENCRYPTION_KEY` to a 32-byte key (64 hex characters or base64) to encrypt auth values at rest. Existing plaintext rows must be rewritten before enabling strict encrypted-only reads. Keep database backups and encryption keys private. Never commit the database, `.env`, pairing codes, or auth credentials.
 
 `MAX_CONCURRENT_CONNECTIONS` limits simultaneous connection handshakes, not the number of accounts the host can sustain. Hundreds of persistent sessions require load testing against host memory, file descriptors, network, database, and reconnect behavior. Do not run two bot processes against the same account IDs without distributed session ownership/locking.
 

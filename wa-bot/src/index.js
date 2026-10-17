@@ -2,7 +2,7 @@ import { getContentType, normalizeMessageContent } from '@whiskeysockets/baileys
 import { existsSync } from 'node:fs';
 import { createAuthStore, DisconnectReason, MultiSocketManager, WaManagerError } from 'wa-multi-socket';
 import { commandMap } from './commands.js';
-import { log, setDebug } from './logger.js';
+import { isDebug, log, setDebug } from './logger.js';
 import { assertSecureHost, createServer } from './server.js';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
@@ -167,7 +167,7 @@ async function handleUpsert(userId, socket, messages, type) {
         'message',
         `[${displayUserId(userId)}] ${fromMe ? '➡️ outgoing' : '⬅️ incoming'} | ${contentType} | ${isGroup ? '👥' : '👤'} ${displayAddress(sender)}`,
       );
-      if (DEBUG && text) log.debug('🧾', 'message.preview', text.slice(0, 120));
+      if (isDebug() && text) log.debug('🧾', 'message.preview', text.slice(0, 120));
 
       if (!text.startsWith(PREFIX)) continue;
       const [rawName = '', ...args] = text.slice(PREFIX.length).trim().split(/\s+/);
@@ -217,7 +217,7 @@ log.banner([
   '🤖 wa-multi-socket test bot',
   `⚙️  prefix: ${PREFIX}   🐛 debug: ${DEBUG ? 'ON' : 'OFF'}   📦 Node ${process.version}`,
   `🌐 API: http://${HOST}:${PORT}   🔒 api key: ${API_KEY ? 'required' : 'off'}`,
-  `👑 owners: ${OWNERS.length ? OWNERS.join(', ') : '(linked account itself only)'}`,
+  `👑 owners: ${OWNERS.length ? OWNERS.map(displayAddress).join(', ') : '(linked account itself only)'}`,
 ]);
 
 const app = createServer({ manager, apiKey: API_KEY, pairingWindowMs: PAIRING_WINDOW_MS });

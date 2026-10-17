@@ -43,8 +43,11 @@
 - Restore saved accounts automatically with `manager.start()`.
 - Bound simultaneous handshakes and pairing requests to avoid startup spikes.
 - Retry transient disconnects with capped exponential backoff and jitter.
+- Queue outgoing messages per account, with a configurable minimum delay and bounded queue.
+- Track connection state and aggregate manager statistics.
+- Optionally encrypt auth values at rest with AES-256-GCM.
 - Receive manager lifecycle events for connect, disconnect, pairing, logout, and errors.
-- Disconnect a user temporarily or remove their saved authentication completely.
+- Disconnect temporarily, log out, or remove saved authentication completely.
 
 ### How it fits together
 
@@ -92,7 +95,7 @@ const manager = new MultiSocketManager({
 	reconnectDelays: {
 		[DisconnectReason.connectionLost]: 2_000,
 		[DisconnectReason.connectionClosed]: 1_000,
-		[DisconnectReason.connectionReplaced]: 5_000,
+		[DisconnectReason.connectionReplaced]: null,
 		[DisconnectReason.badSession]: 10_000,
 		[DisconnectReason.restartRequired]: 1_000,
 		[DisconnectReason.unavailableService]: 15_000,
@@ -194,13 +197,15 @@ await whatsapp.start();
 Use a user's socket anywhere in your app:
 
 ```ts
-const socket = whatsapp.getSocket(userId);
-if (!socket) throw new Error(`No active socket for ${userId}`);
+const socket = whatsapp.getConnectedSocket(userId);
+if (!socket) throw new Error(`No connected socket for ${userId}`);
 
-await socket.sendMessage(jid, { text: 'Reply from this user session' });
+await whatsapp.sendMessage(userId, jid, { text: 'Reply from this user session' });
 ```
 
 Choose a stable application ID for each account, such as a database user ID or tenant ID. Reusing that same ID after a restart loads its saved authentication. The `userId` does not have to be the phone number.
+
+`sendMessage()` spaces sends through a per-user queue and rejects with `QUEUE_FULL` when the queue is full. `disconnectUser()` cancels a connection waiting for a handshake slot and any sends still queued for that account. Queued messages are never replayed through a later connection.
 
 ## 👥 Manage multiple users
 
@@ -262,9 +267,14 @@ Subscribe to manager lifecycle events with `manager.events`, a Node.js `EventEmi
 | `user:connected` | Baileys reports `connection: 'open'` | `userId`, `socket`, `reconnecting` |
 | `user:disconnected` | A socket closes or is manually disconnected | `userId`, `socket`, `reason`, `error`; manual close includes `manual: true` |
 | `user:reconnecting` | An automatic retry is scheduled | `userId`, `reason`, `delayMs` |
+| `user:reconnect-disabled` | Retry policy says not to reconnect | `userId`, `reason` |
+| `user:reconnect-failed` | The configured retry limit is reached | `userId`, `attempts`, `reason` |
 | `user:pairing-code` | A pairing code is generated | `userId`, `pairingCode` |
+| `user:paired` | Credentials indicate pairing completed | `userId`, `socket` |
+| `user:pairing-failed` | Pairing expires or fails and temporary auth is removed | `userId`, `reason`, `error` |
 | `user:logged-out` | Baileys reports `loggedOut` and auth is deleted | `userId`, `reason` |
 | `user:removed` | `removeUser()` finishes | `userId` |
+| `user:pruned` | Startup removes an unfinished pairing | `userId` |
 | `baileys:connection.update` | Baileys emits a connection update | `userId`, `socket`, `update` |
 | `baileys:creds.update` | Baileys updates credentials | `userId`, `socket` |
 | `manager:error` | Session restore, storage, or socket management fails | `error`; `userId` may be absent |
@@ -291,7 +301,7 @@ Set `reconnectDelays` using Baileys `DisconnectReason` values. A delay is in mil
 |---|---:|---|
 | `connectionClosed` | 428 | Retry after 1 second |
 | `connectionLost` / `timedOut` | 408 | Retry after 2 seconds |
-| `connectionReplaced` | 440 | Retry after 5 seconds |
+| `connectionReplaced` | 440 | No automatic retry; another process may own the session |
 | `badSession` | 500 | Retry after 10 seconds |
 | `restartRequired` | 515 | Retry after 1 second |
 | `unavailableService` | 503 | Retry after 15 seconds |
@@ -319,7 +329,7 @@ Reconnect delays are initial delays: repeated failures increase the wait exponen
 
 ## ⚖️ Capacity and connection management
 
-The manager limits in-progress handshakes to 20 and pairing-code requests to 5 by default. A handshake slot is held until Baileys reports open/close or the attempt times out. Tune these per server rather than launching hundreds of logins at once:
+The manager limits in-progress handshakes to 20 and pairing-code requests to 5 by default. A handshake slot is held until Baileys reports open, reaches the pairing screen, closes, or times out. Tune these per server rather than launching hundreds of logins at once:
 
 ```ts
 const manager = new MultiSocketManager({
@@ -338,7 +348,7 @@ These limits control connection and pairing bursts; they do not cap the number o
 
 ### Local SQLite
 
-With no URL, `createAuthStore()` creates `./data/wa-auth.sqlite` relative to the current working directory. It uses Node's built-in `node:sqlite` module; no separate SQLite package is required.
+With no URL, `createAuthStore()` creates `./data/wa-auth.sqlite` relative to the current working directory. It uses Node's built-in `node:sqlite` module; no separate SQLite package is required. New database directories use owner-only permissions, and file permissions are restricted to the owner; initialization fails if the database file cannot be secured.
 
 ```ts
 const manager = new MultiSocketManager({
@@ -379,14 +389,20 @@ The PostgreSQL adapter creates a `wa_auth` table if needed. For another SQL driv
 | `addUser(userId, options?)` | Create a user's socket; request a pairing code when `phoneNumber` is provided and credentials are not registered. |
 | `connectUser(userId)` | Create or return a socket without requesting a pairing code. |
 | `requestPairingCode(userId, phoneNumber, customCode?)` | Request a code for an unregistered account. |
-| `getSocket(userId)` | Return that user's managed socket, or `undefined`. |
+| `waitForConnection(userId, timeoutMs?)` | Resolve when the user's socket opens, or reject on timeout. |
+| `getSocket(userId)` | Return that user's managed socket, including one still connecting, or `undefined`. |
+| `getConnectedSocket(userId)` | Return the socket only after Baileys reports it open, or `undefined`. |
 | `getSockets()` | Return a snapshot `ReadonlyMap<string, WASocket>`. |
 | `getUserIds()` | Return IDs for currently managed sockets. |
+| `getConnectedUserIds()` | Return IDs whose sockets are currently open. |
+| `getStatus(userId)` / `getStats()` | Read an account's state or aggregate connection counts. |
+| `sendMessage(userId, jid, content, options?)` | Send through the bounded, rate-spaced per-user queue. |
 | `disconnectUser(userId)` | Close the socket and keep saved auth. |
+| `logoutUser(userId)` | Unlink the WhatsApp device when possible, then delete saved auth. |
 | `removeUser(userId)` | Close the socket and delete all auth records for that user. |
 | `close()` | Close managed sockets and the auth store; keep saved auth for a future manager instance. |
 
-`maxConcurrentConnections`, `maxConcurrentPairings`, `connectionAttemptTimeoutMs`, `reconnectJitterMs`, and `maxReconnectDelayMs` configure the corresponding limits described above.
+Connection states are `connecting`, `awaiting-pairing`, `open`, `reconnecting`, and `offline`. Useful tuning options include `maxConcurrentConnections`, `maxConcurrentPairings`, `connectionAttemptTimeoutMs`, `pairingTimeoutMs`, `maxReconnectAttempts`, `reconnectJitterMs`, `maxReconnectDelayMs`, `sendIntervalMs`, `sendJitterMs`, and `maxQueuedMessagesPerUser`. Timer options must fit within Node.js's maximum timer delay.
 
 After a real `loggedOut` disconnect, the auth records are deleted. Calling `addUser()` again with the same ID creates a fresh auth state that can be paired again.
 
@@ -400,12 +416,12 @@ After a real `loggedOut` disconnect, the auth records are deleted. Calling `addU
   });
   ```
 
-  Existing plaintext records remain readable by default; new writes are encrypted. After migrating old records, set `requireEncrypted: true` to reject any remaining plaintext. Keep the encryption key separate from database backups.
+  Existing plaintext records remain readable by default; new writes are encrypted. Existing rows are rewritten only when the library saves them again, so verify all records have been migrated before setting `requireEncrypted: true`. Keep the encryption key separate from database backups.
 - Run one manager process per `userId`. If multiple application instances may manage the same account, add distributed locking or another ownership mechanism.
 - For 600–700 concurrent accounts, benchmark on the intended host and shard accounts across processes/hosts as needed. Connection limits smooth session startup; they are not a guarantee of the hardware capacity or a limit on established socket memory.
 - Call `manager.close()` during graceful shutdown. It closes sockets and the database handle/pool without deleting saved auth.
 - `disconnectUser()` is temporary and keeps auth. `removeUser()` deletes stored auth. A WhatsApp `loggedOut` disconnect always deletes auth and is never retried.
-- `manager.events` uses Node's `EventEmitter`. Exceptions thrown by your listeners can propagate through the event flow; handle errors inside application listeners.
+- `manager.events` uses Node's `EventEmitter`. A listener exception is reported through `manager:error`; listener code should still handle its own async errors because EventEmitter does not await returned promises.
 - Use WhatsApp accounts responsibly and in accordance with WhatsApp's Terms of Service.
 
 ## 🧪 Development

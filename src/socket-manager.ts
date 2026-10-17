@@ -99,6 +99,7 @@ type ManagedSocket = {
 };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 class AsyncLimiter {
   private active = 0;
@@ -106,22 +107,42 @@ class AsyncLimiter {
   private readonly queue: Array<{
     resolve: (release: () => void) => void;
     reject: (error: Error) => void;
+    cleanup: () => void;
   }> = [];
 
   constructor(private readonly limit: number) {}
 
-  acquire(): Promise<() => void> {
+  acquire(signal?: AbortSignal): Promise<() => void> {
     if (this.closed) return Promise.reject(new WaManagerError('CLOSED', 'The socket manager is closed.'));
+    if (signal?.aborted) {
+      return Promise.reject(new WaManagerError('NOT_AVAILABLE', 'Connection request was cancelled.'));
+    }
     if (this.active < this.limit) {
       this.active += 1;
       return Promise.resolve(this.createRelease());
     }
-    return new Promise((resolve, reject) => this.queue.push({ resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve,
+        reject,
+        cleanup: () => signal?.removeEventListener('abort', onAbort),
+      };
+      const onAbort = () => {
+        const index = this.queue.indexOf(waiter);
+        if (index < 0) return;
+        this.queue.splice(index, 1);
+        waiter.cleanup();
+        reject(new WaManagerError('NOT_AVAILABLE', 'Connection request was cancelled.'));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.queue.push(waiter);
+    });
   }
 
   close(): void {
     this.closed = true;
     for (const waiter of this.queue.splice(0)) {
+      waiter.cleanup();
       waiter.reject(new WaManagerError('CLOSED', 'The socket manager is closed.'));
     }
   }
@@ -134,6 +155,7 @@ class AsyncLimiter {
       this.active -= 1;
       const next = this.queue.shift();
       if (next && !this.closed) {
+        next.cleanup();
         this.active += 1;
         next.resolve(this.createRelease());
       }
@@ -157,8 +179,33 @@ function nonNegativeInteger(value: number | undefined, fallback: number, name: s
   return result;
 }
 
+function timerDelay(
+  value: number | undefined,
+  fallback: number,
+  name: string,
+  allowZero = false,
+): number {
+  const result = value ?? fallback;
+  const minimum = allowZero ? 0 : 1;
+  if (!Number.isSafeInteger(result) || result < minimum || result > MAX_TIMER_DELAY_MS) {
+    throw new WaManagerError(
+      'INVALID_ARGUMENT',
+      `${name} must be an integer between ${minimum} and ${MAX_TIMER_DELAY_MS}.`,
+    );
+  }
+  return result;
+}
+
 const USER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$/;
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9]{8}$/;
+
+function validateReconnectDelays(delays: Partial<Record<DisconnectReason, number | null>>) {
+  for (const [reason, delay] of Object.entries(delays)) {
+    if (delay !== null && (!Number.isSafeInteger(delay) || delay < 0)) {
+      throw new WaManagerError('INVALID_ARGUMENT', `Reconnect delay for reason ${reason} must be null or a non-negative safe integer.`);
+    }
+  }
+}
 
 const defaultReconnectDelays: Partial<Record<DisconnectReason, number | null>> = {
   [DisconnectReason.connectionClosed]: 1_000,
@@ -178,10 +225,12 @@ export class MultiSocketManager {
 
   private readonly sockets = new Map<string, ManagedSocket>();
   private readonly pending = new Map<string, Promise<WASocket>>();
+  private readonly connectionControllers = new Map<string, AbortController>();
   private readonly retiring = new Map<string, Promise<void>>();
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
   private readonly reconnectAttempts = new Map<string, number>();
   private readonly pairingUsers = new Set<string>();
+  private readonly pairingOperations = new Map<string, { cancelled: boolean }>();
   private readonly inflight = new Set<Promise<unknown>>();
   private readonly reconnectDelays: Partial<Record<DisconnectReason, number | null>>;
   private readonly connectionLimiter: AsyncLimiter;
@@ -205,6 +254,12 @@ export class MultiSocketManager {
 
   constructor(private readonly options: MultiSocketManagerOptions) {
     this.reconnectDelays = { ...defaultReconnectDelays, ...options.reconnectDelays };
+    validateReconnectDelays(this.reconnectDelays);
+    const sendIntervalMs = timerDelay(options.sendIntervalMs, 1_000, 'sendIntervalMs', true);
+    const sendJitterMs = timerDelay(options.sendJitterMs, 500, 'sendJitterMs', true);
+    if (sendIntervalMs + sendJitterMs > MAX_TIMER_DELAY_MS) {
+      throw new WaManagerError('INVALID_ARGUMENT', 'sendIntervalMs + sendJitterMs must not exceed the maximum timer delay.');
+    }
     this.connectionLimiter = new AsyncLimiter(
       positiveInteger(options.maxConcurrentConnections, 20, 'maxConcurrentConnections'),
     );
@@ -212,20 +267,20 @@ export class MultiSocketManager {
       positiveInteger(options.maxConcurrentPairings, 5, 'maxConcurrentPairings'),
     );
     this.sendScheduler = new SendScheduler(
-      nonNegativeInteger(options.sendIntervalMs, 1_000, 'sendIntervalMs'),
-      nonNegativeInteger(options.sendJitterMs, 500, 'sendJitterMs'),
+      sendIntervalMs,
+      sendJitterMs,
       positiveInteger(options.maxQueuedMessagesPerUser, 100, 'maxQueuedMessagesPerUser'),
     );
     this.cfg = {
-      connectionAttemptTimeoutMs: positiveInteger(options.connectionAttemptTimeoutMs, 60_000, 'connectionAttemptTimeoutMs'),
-      pairingTimeoutMs: positiveInteger(options.pairingTimeoutMs, 180_000, 'pairingTimeoutMs'),
-      reconnectJitterMs: nonNegativeInteger(options.reconnectJitterMs, 1_000, 'reconnectJitterMs'),
-      maxReconnectDelayMs: positiveInteger(options.maxReconnectDelayMs, 60_000, 'maxReconnectDelayMs'),
+      connectionAttemptTimeoutMs: timerDelay(options.connectionAttemptTimeoutMs, 60_000, 'connectionAttemptTimeoutMs'),
+      pairingTimeoutMs: timerDelay(options.pairingTimeoutMs, 180_000, 'pairingTimeoutMs'),
+      reconnectJitterMs: timerDelay(options.reconnectJitterMs, 1_000, 'reconnectJitterMs', true),
+      maxReconnectDelayMs: timerDelay(options.maxReconnectDelayMs, 60_000, 'maxReconnectDelayMs'),
       defaultReconnectDelayMs: nonNegativeInteger(options.defaultReconnectDelayMs, 3_000, 'defaultReconnectDelayMs'),
-      stableConnectionMs: nonNegativeInteger(options.stableConnectionMs, 30_000, 'stableConnectionMs'),
+      stableConnectionMs: timerDelay(options.stableConnectionMs, 30_000, 'stableConnectionMs', true),
       maxReconnectAttempts: positiveInteger(options.maxReconnectAttempts, 20, 'maxReconnectAttempts'),
       pairingRetries: nonNegativeInteger(options.pairingRetries, 2, 'pairingRetries'),
-      pairingRetryDelayMs: nonNegativeInteger(options.pairingRetryDelayMs, 2_000, 'pairingRetryDelayMs'),
+      pairingRetryDelayMs: timerDelay(options.pairingRetryDelayMs, 2_000, 'pairingRetryDelayMs', true),
       pruneUnregisteredOnStart: options.pruneUnregisteredOnStart ?? true,
       cacheSignalKeys: options.cacheSignalKeys ?? true,
     };
@@ -351,6 +406,8 @@ export class MultiSocketManager {
   }
 
   waitForConnection(userId: string, timeoutMs = 30_000): Promise<WASocket> {
+    this.assertUserId(userId);
+    timerDelay(timeoutMs, timeoutMs, 'timeoutMs', true);
     const current = this.getConnectedSocket(userId);
     if (current) return Promise.resolve(current);
     return new Promise((resolve, reject) => {
@@ -378,6 +435,7 @@ export class MultiSocketManager {
     content: AnyMessageContent,
     options?: MiscMessageGenerationOptions,
   ): Promise<Awaited<ReturnType<WASocket['sendMessage']>>> {
+    this.assertUserId(userId);
     this.requireConnected(userId);
     return this.sendScheduler.run(userId, async () => {
       const socket = this.requireConnected(userId); // re-check: it may have dropped while queued
@@ -386,15 +444,18 @@ export class MultiSocketManager {
   }
 
   async disconnectUser(userId: string): Promise<void> {
+    this.assertUserId(userId);
     await this.stopUser(userId, false);
   }
 
   async removeUser(userId: string): Promise<void> {
+    this.assertUserId(userId);
     await this.stopUser(userId, true);
   }
 
   /** Unlinks the device on WhatsApp's side too, then deletes all saved auth. */
   async logoutUser(userId: string): Promise<void> {
+    this.assertUserId(userId);
     const entry = this.sockets.get(userId);
     if (entry && !entry.closed) {
       try {
@@ -431,26 +492,41 @@ export class MultiSocketManager {
     const currentPending = this.pending.get(userId);
     if (currentPending) return currentPending;
 
-    const connection = this.openSocket(userId, reconnecting);
+    const controller = new AbortController();
+    const connection = this.openSocket(userId, reconnecting, controller.signal);
+    this.connectionControllers.set(userId, controller);
     this.pending.set(userId, connection);
     try {
       return await connection;
     } finally {
       if (this.pending.get(userId) === connection) this.pending.delete(userId);
+      if (this.connectionControllers.get(userId) === controller) {
+        this.connectionControllers.delete(userId);
+      }
     }
   }
 
-  private async openSocket(userId: string, reconnecting: boolean): Promise<WASocket> {
-    const releaseSlot = await this.connectionLimiter.acquire();
+  private async openSocket(
+    userId: string,
+    reconnecting: boolean,
+    signal: AbortSignal,
+  ): Promise<WASocket> {
+    const releaseSlot = await this.connectionLimiter.acquire(signal);
     if (this.closing) {
       releaseSlot();
       throw new WaManagerError('CLOSED', 'The socket manager is closed.');
     }
+    if (signal.aborted) {
+      releaseSlot();
+      throw new WaManagerError('NOT_AVAILABLE', 'Connection request was cancelled.');
+    }
     this.emit('user:connecting', { userId, reconnecting });
+    let session: SessionAuthStore | undefined;
     try {
-      const session = new SessionAuthStore(this.options.authStore);
+      session = new SessionAuthStore(this.options.authStore);
       const state = await loadAuthState(session, userId);
       if (this.closing) throw new WaManagerError('CLOSED', 'The socket manager is closed.');
+      if (signal.aborted) throw new WaManagerError('NOT_AVAILABLE', 'Connection request was cancelled.');
 
       // Always use our pino-pretty logger. If socketConfig.logger were reused here,
       // a raw Pino logger could bypass pino-pretty and print JSON to the terminal.
@@ -492,8 +568,14 @@ export class MultiSocketManager {
       this.attachListeners(userId, entry);
       return socket;
     } catch (error) {
+      if (session) {
+        session.revoke();
+        await session.drain();
+      }
       releaseSlot();
-      logger.error('Failed to create socket', userId);
+      if (!(error instanceof WaManagerError && (error.code === 'CLOSED' || error.code === 'NOT_AVAILABLE'))) {
+        logger.error('Failed to create socket', userId);
+      }
       throw error;
     }
   }
@@ -573,6 +655,7 @@ export class MultiSocketManager {
   private async handleDisconnect(userId: string, entry: ManagedSocket, error: unknown): Promise<void> {
     if (this.sockets.get(userId) !== entry || entry.closed) return;
     entry.closed = true;
+    this.sendScheduler.forget(userId);
     this.clearEntryTimers(entry);
     this.rejectPairingReadyWaiters(entry, error);
     entry.releaseConnectionSlot();
@@ -673,6 +756,10 @@ export class MultiSocketManager {
       this.reconnectTimers.delete(userId);
       if (entry && this.sockets.get(userId) === entry) this.sockets.delete(userId);
       void this.connectUserInternal(userId, true).catch((error: unknown) => {
+        if (
+          this.closing ||
+          error instanceof WaManagerError && (error.code === 'CLOSED' || error.code === 'NOT_AVAILABLE')
+        ) return;
         this.emit('manager:error', { userId, error });
         this.scheduleReconnect(userId, undefined);
       });
@@ -695,36 +782,50 @@ export class MultiSocketManager {
     phone: string,
     customCode?: string,
   ): Promise<{ socket: WASocket; code: string }> {
-    const attempts = 1 + this.cfg.pairingRetries;
-    let lastError: unknown;
+    if (this.pairingOperations.has(userId)) {
+      throw new WaManagerError('PAIRING_IN_PROGRESS', `A pairing request is already in progress for user "${userId}".`);
+    }
+    const operation = { cancelled: false };
+    this.pairingOperations.set(userId, operation);
+    try {
+      const attempts = 1 + this.cfg.pairingRetries;
+      let lastError: unknown;
 
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      try {
-        const socket = await this.connectUser(userId); // fresh socket if the old one died
-        if (this.isUserPaired(userId)) {
-          throw new WaManagerError('ALREADY_PAIRED', `User "${userId}" is already paired.`);
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        if (operation.cancelled) {
+          lastError = new WaManagerError('NOT_AVAILABLE', `Pairing was cancelled for user "${userId}".`);
+          break;
         }
-        const code = await this.requestPairingCodeForSocket(userId, socket, phone, customCode);
-        return { socket, code };
-      } catch (error) {
-        lastError = error;
-        if (this.closing || !this.isRetryablePairingError(error) || attempt === attempts) break;
-        logger.warn(`Pairing attempt ${attempt} failed; retrying`, userId);
-        await sleep(this.cfg.pairingRetryDelayMs * attempt);
+        try {
+          const socket = await this.connectUser(userId); // fresh socket if the old one died
+          if (this.isUserPaired(userId)) {
+            throw new WaManagerError('ALREADY_PAIRED', `User "${userId}" is already paired.`);
+          }
+          const code = await this.requestPairingCodeForSocket(userId, socket, phone, customCode);
+          return { socket, code };
+        } catch (error) {
+          lastError = error;
+          if (this.closing || operation.cancelled || !this.isRetryablePairingError(error) || attempt === attempts) break;
+          logger.warn(`Pairing attempt ${attempt} failed; retrying`, userId);
+          await sleep(Math.min(this.cfg.pairingRetryDelayMs * attempt, MAX_TIMER_DELAY_MS));
+        }
       }
-    }
 
-    // Give up. Remove the half-created account so no zombie session/auth is left behind.
-    const code = lastError instanceof WaManagerError ? lastError.code : undefined;
-    const keep = code === 'PAIRING_IN_PROGRESS' || code === 'ALREADY_PAIRED' || code === 'CLOSED';
-    if (!keep && !this.isUserPaired(userId)) {
-      await this.stopUser(userId, true).catch((error: unknown) =>
-        this.emit('manager:error', { userId, error }),
-      );
-      this.emit('user:pairing-failed', { userId, error: lastError });
+      // Give up. Remove the half-created account so no zombie session/auth is left behind.
+      const code = lastError instanceof WaManagerError ? lastError.code : undefined;
+      const keep = operation.cancelled || code === 'PAIRING_IN_PROGRESS' || code === 'ALREADY_PAIRED' || code === 'CLOSED';
+      if (!keep && !this.isUserPaired(userId)) {
+        await this.stopUser(userId, true).catch((error: unknown) =>
+          this.emit('manager:error', { userId, error }),
+        );
+        this.emit('user:pairing-failed', { userId, error: lastError });
+      }
+      if (operation.cancelled) logger.warn('Pairing cancelled', userId);
+      else logger.error('Pairing failed', userId);
+      throw lastError;
+    } finally {
+      if (this.pairingOperations.get(userId) === operation) this.pairingOperations.delete(userId);
     }
-    logger.error('Pairing failed', userId);
-    throw lastError;
   }
 
   private async discardIfUnpaired(userId: string): Promise<void> {
@@ -738,7 +839,11 @@ export class MultiSocketManager {
   
   private isRetryablePairingError(error: unknown): boolean {
     if (!(error instanceof WaManagerError)) return true; // Baileys / network errors
-    return error.code === 'PAIRING_TIMEOUT' || error.code === 'NOT_AVAILABLE';
+    return (
+      error.code === 'PAIRING_TIMEOUT' ||
+      error.code === 'CONNECTION_TIMEOUT' ||
+      error.code === 'NOT_AVAILABLE'
+    );
   }
 
   private async requestPairingCodeForSocket(
@@ -805,10 +910,27 @@ export class MultiSocketManager {
 
   // ───────────────────────────── stop / close ─────────────────────────────
 
-  private async stopUser(userId: string, deleteAuth: boolean): Promise<void> {
-    this.cancelReconnect(userId);
+  private stopUser(userId: string, deleteAuth: boolean): Promise<void> {
     const retiring = this.retiring.get(userId);
-    if (retiring) await retiring.catch(() => undefined);
+    if (retiring) {
+      return retiring.catch(() => undefined).then(() => this.stopUser(userId, deleteAuth));
+    }
+
+    const task = Promise.resolve().then(() => this.stopUserInternal(userId, deleteAuth));
+    this.retiring.set(userId, task);
+    const clear = () => {
+      if (this.retiring.get(userId) === task) this.retiring.delete(userId);
+    };
+    task.then(clear, clear);
+    return task;
+  }
+
+  private async stopUserInternal(userId: string, deleteAuth: boolean): Promise<void> {
+    const pairing = this.pairingOperations.get(userId);
+    if (pairing) pairing.cancelled = true;
+    this.connectionControllers.get(userId)?.abort();
+    this.cancelReconnect(userId);
+    this.sendScheduler.forget(userId);
     const pending = this.pending.get(userId);
     if (pending) await pending.catch(() => undefined);
 
@@ -826,7 +948,6 @@ export class MultiSocketManager {
     }
     if (deleteAuth) {
       await this.options.authStore.deleteUser(userId);
-      this.sendScheduler.forget(userId);
       this.emit('user:removed', { userId });
     }
     this.reconnectAttempts.delete(userId);

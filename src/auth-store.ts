@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Pool } from 'pg';
+import logger from './logger.js';
 
 export type AuthRecord = {
   key: string;
@@ -50,9 +51,10 @@ export class SQLiteAuthStore implements AuthStore {
     this.database = new DatabaseSync(path);
     if (!inMemory) {
       try {
-        chmodSync(path, 0o600); // credentials: owner read/write only
-      } catch {
-        /* best effort (e.g. unsupported on some platforms) */
+        chmodSync(path, 0o600);
+      } catch (error) {
+        this.database.close();
+        throw error;
       }
     }
     this.database.exec(
@@ -139,7 +141,11 @@ export class PostgresAuthStore implements AuthStore {
   private readonly initialization: Promise<void>;
   private closed = false;
 
-  constructor(connectionString: string, onError: (error: Error) => void = () => undefined) {
+  constructor(
+    connectionString: string,
+    onError: (error: Error) => void = (error) =>
+      logger.error('Idle PostgreSQL client error', 'DATABASE', error),
+  ) {
     this.pool = new Pool({ connectionString });
     // An unhandled 'error' event on an idle client would crash the whole process.
     this.pool.on('error', onError);
@@ -240,7 +246,7 @@ const ENCRYPTED_PREFIX = 'enc:v1:';
 function parseKey(key: string | Buffer): Buffer {
   if (Buffer.isBuffer(key)) {
     if (key.length !== 32) throw new Error('Encryption key must be exactly 32 bytes.');
-    return key;
+    return Buffer.from(key);
   }
   const candidates = [
     /^[0-9a-fA-F]{64}$/.test(key) ? Buffer.from(key, 'hex') : undefined,
