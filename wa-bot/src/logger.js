@@ -6,7 +6,7 @@ const c = {
   cyan: '\x1b[36m', gray: '\x1b[90m',
 };
 
-let debugEnabled = true;
+let debugEnabled = false;
 export const setDebug = (on) => { debugEnabled = on; };
 export const isDebug = () => debugEnabled;
 

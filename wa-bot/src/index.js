@@ -1,25 +1,23 @@
 import { getContentType, normalizeMessageContent } from '@whiskeysockets/baileys';
+import { existsSync } from 'node:fs';
 import { createAuthStore, DisconnectReason, MultiSocketManager, WaManagerError } from 'wa-multi-socket';
 import { commandMap } from './commands.js';
 import { log, setDebug } from './logger.js';
-import { createServer } from './server.js';
+import { assertSecureHost, createServer } from './server.js';
 
-try {
-  process.loadEnvFile('.env');
-} catch {
-  /* .env is optional */
-}
+if (existsSync('.env')) process.loadEnvFile('.env');
 
 // ───────────────────────────── config ─────────────────────────────
 const env = process.env;
-const DEBUG = (env.DEBUG ?? 'true') !== 'false';
+const DEBUG = env.DEBUG === 'true';
 const PREFIX = env.PREFIX || '!';
-const OWNERS = (env.OWNERS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+const OWNERS = (env.OWNERS ?? '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean);
 const PORT = Number(env.PORT ?? 3000);
 const HOST = env.HOST || '127.0.0.1';
-const API_KEY = env.API_KEY || undefined;
+const API_KEY = env.API_KEY || env.BOT_API_TOKEN || undefined;
 const PAIRING_WINDOW_MS = 180_000;
 setDebug(DEBUG);
+assertSecureHost(HOST, API_KEY);
 
 const reasonName = (reason) => {
   if (typeof reason !== 'number') return 'unknown';
@@ -28,6 +26,18 @@ const reasonName = (reason) => {
 };
 const userPart = (jid) => jid.split('@')[0].split(':')[0];
 const maskCode = (code) => (code ? `${String(code).slice(0, 2)}******` : '');
+const displayUserId = (userId) => {
+  const match = String(userId).match(/^(user-)?(\d{7,15})$/);
+  return match ? `${match[1] ?? ''}***${match[2].slice(-4)}` : userId;
+};
+const displayAddress = (address) => {
+  const value = String(address ?? '');
+  const [local, domain] = value.split('@');
+  const number = local?.split(':')[0] ?? '';
+  return /^\d{7,15}$/.test(number)
+    ? `***${number.slice(-4)}${domain ? `@${domain}` : ''}`
+    : value;
+};
 
 // ───────────────────────────── manager ─────────────────────────────
 // Baileys' own logger is configured inside wa-multi-socket (LOG_LEVEL env).
@@ -41,6 +51,8 @@ const manager = new MultiSocketManager({
     syncFullHistory: false,
     getMessage: async () => undefined,
   },
+  maxConcurrentConnections: Number(env.MAX_CONCURRENT_CONNECTIONS ?? 20),
+  maxConcurrentPairings: Number(env.MAX_CONCURRENT_PAIRINGS ?? 5),
   pairingTimeoutMs: PAIRING_WINDOW_MS,
   sendIntervalMs: Number(env.SEND_INTERVAL_MS ?? 400),
   sendJitterMs: 100,
@@ -49,29 +61,29 @@ const manager = new MultiSocketManager({
 // ───────────────────────── manager event logs ─────────────────────────
 const ev = manager.events;
 ev.on('user:connecting', ({ userId, reconnecting }) =>
-  log.info('🔌', 'connecting', `${userId}${reconnecting ? ' (reconnect)' : ''}`));
+  log.info('🔌', 'connecting', `${displayUserId(userId)}${reconnecting ? ' (reconnect)' : ''}`));
 ev.on('user:connected', ({ userId, socket, reconnecting }) =>
-  log.ok('🟢', 'connected', `${userId} ${reconnecting ? 'reconnected 🔁' : 'connected 🎉'} as ${socket.user?.id ?? 'unknown'}`));
+  log.ok('🟢', 'connected', `${displayUserId(userId)} ${reconnecting ? 'reconnected 🔁' : 'connected 🎉'} as ${displayAddress(socket.user?.id ?? 'unknown')}`));
 ev.on('user:disconnected', ({ userId, reason, manual, error }) =>
-  log.warn('🔴', 'disconnected', `${userId} reason=${reasonName(reason)} manual=${Boolean(manual)}`, error));
+  log.warn('🔴', 'disconnected', `${displayUserId(userId)} reason=${reasonName(reason)} manual=${Boolean(manual)}`, error));
 ev.on('user:reconnecting', ({ userId, reason, delayMs, attempt }) =>
-  log.warn('🔁', 'reconnecting', `${userId} attempt #${attempt} in ${delayMs}ms (${reasonName(reason)})`));
+  log.warn('🔁', 'reconnecting', `${displayUserId(userId)} attempt #${attempt} in ${delayMs}ms (${reasonName(reason)})`));
 ev.on('user:reconnect-disabled', ({ userId, reason }) =>
-  log.warn('⛔', 'reconnect-disabled', `${userId} will not retry (${reasonName(reason)})`));
+  log.warn('⛔', 'reconnect-disabled', `${displayUserId(userId)} will not retry (${reasonName(reason)})`));
 ev.on('user:reconnect-failed', ({ userId, attempts }) =>
-  log.error('💥', 'reconnect-failed', `${userId} gave up after ${attempts} attempts (auth kept)`));
+  log.error('💥', 'reconnect-failed', `${displayUserId(userId)} gave up after ${attempts} attempts (auth kept)`));
 ev.on('user:pairing-code', ({ userId, pairingCode }) =>
-  log.ok('🔑', 'pairing-code', `${userId} code issued (${maskCode(pairingCode)}) - returned to the HTTP caller only`));
-ev.on('user:paired', ({ userId }) => log.ok('🔗', 'paired', `${userId} linked successfully ✨`));
+  log.ok('🔑', 'pairing-code', `${displayUserId(userId)} code issued (${maskCode(pairingCode)}) - returned to the HTTP caller only`));
+ev.on('user:paired', ({ userId }) => log.ok('🔗', 'paired', `${displayUserId(userId)} linked successfully ✨`));
 ev.on('user:pairing-failed', ({ userId, reason, error }) =>
-  log.error('🚫', 'pairing-failed', `${userId} (${reasonName(reason)}) - temporary session cleaned up`, error));
+  log.error('🚫', 'pairing-failed', `${displayUserId(userId)} (${reasonName(reason)}) - temporary session cleaned up`, error));
 ev.on('user:logged-out', ({ userId }) =>
-  log.warn('🚪', 'logged-out', `${userId} logged out, socket closed and auth deleted 🧹`));
-ev.on('user:removed', ({ userId }) => log.info('🗑️', 'removed', userId));
-ev.on('user:pruned', ({ userId }) => log.info('🧹', 'pruned', `${userId} unfinished pairing removed on start`));
+  log.warn('🚪', 'logged-out', `${displayUserId(userId)} logged out, socket closed and auth deleted 🧹`));
+ev.on('user:removed', ({ userId }) => log.info('🗑️', 'removed', displayUserId(userId)));
+ev.on('user:pruned', ({ userId }) => log.info('🧹', 'pruned', `${displayUserId(userId)} unfinished pairing removed on start`));
 ev.on('baileys:connection.update', ({ userId, update }) => {
   const { connection, qr, isNewLogin, receivedPendingNotifications, lastDisconnect } = update;
-  log.debug('📶', 'connection.update', userId, {
+  log.debug('📶', 'connection.update', displayUserId(userId), {
     connection,
     hasQr: Boolean(qr),
     isNewLogin,
@@ -79,13 +91,13 @@ ev.on('baileys:connection.update', ({ userId, update }) => {
     lastDisconnect: lastDisconnect?.error?.message,
   });
 });
-ev.on('baileys:creds.update', ({ userId }) => log.debug('🔐', 'creds.update', `${userId} (value not logged)`));
+ev.on('baileys:creds.update', ({ userId }) => log.debug('🔐', 'creds.update', `${displayUserId(userId)} (value not logged)`));
 ev.on('manager:error', ({ userId, error, event }) =>
-  log.error('🚨', 'manager:error', `${userId ?? '(manager)'} ${event ?? ''}`, error));
+  log.error('🚨', 'manager:error', `${userId ? displayUserId(userId) : '(manager)'} ${event ?? ''}`, error));
 
 // ───────────────────────── per-socket Baileys event logs ─────────────────────────
 function attachSocketLogs(userId, socket) {
-  const tag = (name) => `${userId} > ${name}`;
+  const tag = (name) => `${displayUserId(userId)} > ${name}`;
   socket.ev.on('messages.update', (u) => log.debug('✏️', tag('messages.update'), `${u.length} update(s)`, u));
   socket.ev.on('messages.reaction', (r) => log.debug('😀', tag('messages.reaction'), `${r.length} reaction(s)`, r));
   socket.ev.on('message-receipt.update', (r) => log.debug('📬', tag('receipt'), `${r.length} receipt(s)`));
@@ -131,7 +143,7 @@ function extractText(message) {
 }
 
 async function handleUpsert(userId, socket, messages, type) {
-  log.debug('📥', 'messages.upsert', `${userId}: ${messages.length} message(s) (type=${type})`);
+  log.debug('📥', 'messages.upsert', `${displayUserId(userId)}: ${messages.length} message(s) (type=${type})`);
   if (type !== 'notify') return; // ignore history / append
 
   for (const message of messages) {
@@ -153,21 +165,21 @@ async function handleUpsert(userId, socket, messages, type) {
       log.info(
         '📩',
         'message',
-        `[${userId}] ${fromMe ? '➡️ outgoing' : '⬅️ incoming'} | ${contentType} | ${isGroup ? '👥' : '👤'} ${sender}${message.pushName ? ` (${message.pushName})` : ''}: ${text.slice(0, 120) || '(no text)'}`,
+        `[${displayUserId(userId)}] ${fromMe ? '➡️ outgoing' : '⬅️ incoming'} | ${contentType} | ${isGroup ? '👥' : '👤'} ${displayAddress(sender)}`,
       );
-      log.debug('🧾', 'message.raw', id, message);
+      if (DEBUG && text) log.debug('🧾', 'message.preview', text.slice(0, 120));
 
       if (!text.startsWith(PREFIX)) continue;
       const [rawName = '', ...args] = text.slice(PREFIX.length).trim().split(/\s+/);
       const command = commandMap.get(rawName.toLowerCase());
       if (!command) {
-        log.warn('❓', 'command', `[${userId}] unknown command: ${rawName}`);
+        log.warn('❓', 'command', `[${displayUserId(userId)}] unknown command: ${rawName}`);
         continue;
       }
 
       const isOwner = fromMe || OWNERS.some((o) => userPart(o) === userPart(sender));
       if (command.ownerOnly && !isOwner) {
-        log.warn('🔒', 'command', `[${userId}] ${command.name} is owner-only - denied for ${sender}`);
+        log.warn('🔒', 'command', `[${displayUserId(userId)}] ${command.name} is owner-only - denied for ${displayAddress(sender)}`);
         await manager.sendMessage(userId, jid, { text: '🔒 This command is for the owner only.' }, { quoted: message });
         continue;
       }
@@ -179,13 +191,13 @@ async function handleUpsert(userId, socket, messages, type) {
         edit: (sent, t) => manager.sendMessage(userId, jid, { text: t, edit: sent.key }),
       };
 
-      log.info('⚙️', 'command', `[${userId}] ${PREFIX}${command.name} args=[${args.join(', ')}]`);
+      log.info('⚙️', 'command', `[${displayUserId(userId)}] ${PREFIX}${command.name} received`);
       const t0 = Date.now();
       await command.run(ctx);
-      log.ok('🏁', 'command', `[${userId}] ${command.name} finished (${Date.now() - t0}ms)`);
+      log.ok('🏁', 'command', `[${displayUserId(userId)}] ${command.name} finished (${Date.now() - t0}ms)`);
     } catch (error) {
-      if (error instanceof WaManagerError) log.error('🧯', 'command', `[${userId}] ${error.code}: ${error.message}`, error);
-      else log.error('💣', 'command', `[${userId}] command failed`, error);
+      if (error instanceof WaManagerError) log.error('🧯', 'command', `[${displayUserId(userId)}] ${error.code}: ${error.message}`, error);
+      else log.error('💣', 'command', `[${displayUserId(userId)}] command failed`, error);
     }
   }
 }
@@ -196,8 +208,8 @@ ev.on('user:connected', ({ userId, socket }) => {
   if (attached.has(socket)) return;
   attached.add(socket);
   attachSocketLogs(userId, socket);
-  log.debug('🧩', 'listeners', `${userId}: Baileys listeners attached`);
-  log.info('🤖', 'ready', `${userId} is ready. Send "${PREFIX}ping" from any chat (your own number works too)`);
+  log.debug('🧩', 'listeners', `${displayUserId(userId)}: Baileys listeners attached`);
+  log.info('🤖', 'ready', `${displayUserId(userId)} is ready. Send "${PREFIX}ping" from any chat (your own number works too)`);
 });
 
 // ───────────────────────────── start ─────────────────────────────
@@ -208,19 +220,18 @@ log.banner([
   `👑 owners: ${OWNERS.length ? OWNERS.join(', ') : '(linked account itself only)'}`,
 ]);
 
-process.on('unhandledRejection', (reason) => log.error('🌪️', 'unhandledRejection', String(reason), reason));
-process.on('uncaughtException', (error) => log.error('☠️', 'uncaughtException', error.message, error));
-
+const app = createServer({ manager, apiKey: API_KEY, pairingWindowMs: PAIRING_WINDOW_MS });
 await manager.start();
 log.info('🚀', 'start', `Restored saved sessions: ${manager.getUserIds().length}`);
 
-const app = createServer({ manager, apiKey: API_KEY, pairingWindowMs: PAIRING_WINDOW_MS });
 const server = await new Promise((resolve, reject) => {
   const s = app.listen(PORT, HOST, () => resolve(s));
   s.once('error', reject);
 }).catch((error) => {
   log.error('💥', 'http', `Cannot listen on ${HOST}:${PORT} (${error.code ?? error.message})`, error);
-  process.exit(1);
+  return manager.close().then(() => {
+    process.exit(1);
+  });
 });
 log.ok('🌐', 'http', `API listening on http://${HOST}:${PORT}`);
 

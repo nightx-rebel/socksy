@@ -347,6 +347,11 @@ export function createAuthStore(
   databaseUrl?: string,
   options: CreateAuthStoreOptions = {},
 ): AuthStore {
+  if (options.requireEncrypted && !options.encryptionKey) {
+    throw new Error('requireEncrypted requires an encryptionKey.');
+  }
+  const encryptionKey = options.encryptionKey ? parseKey(options.encryptionKey) : undefined;
+
   let store: AuthStore;
   if (!databaseUrl) {
     store = new SQLiteAuthStore();
@@ -360,7 +365,7 @@ export function createAuthStore(
   } else {
     throw new Error('Unsupported database URL. Use sqlite://, postgres://, or postgresql://.');
   }
-  return options.encryptionKey
-    ? new EncryptedAuthStore(store, options.encryptionKey, !options.requireEncrypted)
+  return encryptionKey
+    ? new EncryptedAuthStore(store, encryptionKey, !options.requireEncrypted)
     : store;
 }

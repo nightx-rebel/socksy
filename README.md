@@ -392,7 +392,15 @@ After a real `loggedOut` disconnect, the auth records are deleted. Calling `addU
 
 ## 🔐 Production notes
 
-- Auth storage contains WhatsApp credentials and cryptographic Signal keys. Restrict database access and keep `DATABASE_URL` secret. This package does not encrypt stored data at rest.
+- Auth storage contains WhatsApp credentials and cryptographic Signal keys. Restrict database access and keep `DATABASE_URL` secret. To encrypt auth values at rest, provide a 32-byte key (64 hex characters or base64) to `createAuthStore()`:
+
+  ```ts
+  const authStore = createAuthStore(process.env.DATABASE_URL, {
+    encryptionKey: process.env.AUTH_ENCRYPTION_KEY,
+  });
+  ```
+
+  Existing plaintext records remain readable by default; new writes are encrypted. After migrating old records, set `requireEncrypted: true` to reject any remaining plaintext. Keep the encryption key separate from database backups.
 - Run one manager process per `userId`. If multiple application instances may manage the same account, add distributed locking or another ownership mechanism.
 - For 600–700 concurrent accounts, benchmark on the intended host and shard accounts across processes/hosts as needed. Connection limits smooth session startup; they are not a guarantee of the hardware capacity or a limit on established socket memory.
 - Call `manager.close()` during graceful shutdown. It closes sockets and the database handle/pool without deleting saved auth.

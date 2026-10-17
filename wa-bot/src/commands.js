@@ -137,6 +137,7 @@ export const commands = [
       const json = JSON.stringify(ctx.message, (_k, v) => (typeof v === 'object' && v?.type === 'Buffer' ? '[Buffer]' : v), 2);
       await ctx.reply('🧾 ```' + json.slice(0, 3000) + (json.length > 3000 ? '\n…(truncated)' : '') + '```');
     },
+    ownerOnly: true,
   },
   {
     name: 'groupinfo',

@@ -49,13 +49,18 @@ function write(
 ): void {
   const color = COLORS[level];
   const icon = ICONS[level];
+  const phoneLikeId = session.match(/^(user-)?(\d{7,15})$/);
+  const phoneNumber = phoneLikeId?.[2];
+  const safeSession = phoneNumber
+    ? `${phoneLikeId?.[1] ?? ''}***${phoneNumber.slice(-4)}`
+    : session;
 
   console.log(
     chalk.gray(timestamp()),
     chalk.gray('│'),
     color(`${icon} ${level.padEnd(7)}`),
     chalk.gray('│'),
-    chalk.hex('#00E5FF')(`[${session}]`),
+    chalk.hex('#00E5FF')(`[${safeSession}]`),
     chalk.gray('│'),
     color(formatMessage(message)),
   );

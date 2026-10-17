@@ -78,6 +78,11 @@ const toJid = (to) => {
   return digits ? `${digits}@s.whatsapp.net` : '';
 };
 
+const displayUserId = (userId) => {
+  const match = String(userId).match(/^(user-)?(\d{7,15})$/);
+  return match ? `${match[1] ?? ''}***${match[2].slice(-4)}` : userId;
+};
+
 /**
  * @param {{
  *   manager: import('wa-multi-socket').MultiSocketManager,
@@ -90,6 +95,10 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
 
   app.disable('x-powered-by');
 
+  app.use((_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
   app.use(express.json({ limit: '10kb' }));
 
   // Every account we have seen.
@@ -98,6 +107,7 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
 
   const ev = manager.events;
 
+  for (const userId of manager.getUserIds()) known.add(userId);
   ev.on('user:connecting', ({ userId }) => {
     known.add(userId);
   });
@@ -151,7 +161,8 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
         return next();
       }
 
-      const given = sha256(req.get('x-api-key') ?? '');
+      const bearerToken = req.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+      const given = sha256(req.get('x-api-key') ?? bearerToken ?? '');
 
       if (timingSafeEqual(given, expected)) {
         return next();
@@ -183,7 +194,6 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
   app.get('/', (_req, res) => {
     res.json({
       ok: true,
-      port: 5000,
       routes: [
         'GET|POST /pair?phone=<number>[&userId=<id>]   -> returns a pairing code',
         'GET  /users                                   -> all accounts + status',
@@ -217,7 +227,7 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
           : {}),
       };
 
-      const phone = String(input.phone ?? '').trim();
+      const phone = String(input.phone ?? input.number ?? '').trim();
       const digits = phone.replace(/\D/g, '');
 
       if (!digits) {
@@ -225,7 +235,7 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
           ok: false,
           error: 'phone_required',
           hint:
-            'curl "http://localhost:5000/pair?phone=<country code + number>"',
+            'curl "http://localhost:3000/pair?phone=<country code + number>"',
         });
       }
 
@@ -234,7 +244,7 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
       log.info(
         '🔑',
         'pair',
-        `Pair request: userId=${userId}, phone=***${digits.slice(-4)}`,
+        `Pair request: userId=${displayUserId(userId)}, phone=***${digits.slice(-4)}`,
       );
 
       const { pairingCode } = await manager.addUser(userId, {
@@ -245,7 +255,7 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
         log.info(
           '♻️',
           'pair',
-          `${userId} is already paired; it is just connecting`,
+          `${displayUserId(userId)} is already paired; it is just connecting`,
         );
 
         return res.json({
@@ -434,9 +444,15 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
     return res.status(500).json({
       ok: false,
       error: 'internal_error',
-      message: error?.message ?? 'unknown',
+      message: 'Internal server error.',
     });
   });
 
   return app;
+}
+
+export function assertSecureHost(host, apiKey) {
+  if (!apiKey && !['localhost', '127.0.0.1', '::1'].includes(host)) {
+    throw new Error('API_KEY is required when HOST is not a loopback address.');
+  }
 }
