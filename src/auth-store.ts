@@ -1,7 +1,6 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { Pool } from 'pg';
 import logger from './logger.js';
 
@@ -34,15 +33,19 @@ function dedupe(records: AuthRecord[]): AuthRecord[] {
   return [...new Map(records.map((record) => [record.key, record])).values()];
 }
 
+// ───────────────────────────────── SQLite ─────────────────────────────────
+
 export class SQLiteAuthStore implements AuthStore {
   private readonly database: DatabaseSync;
   private closed = false;
-  private readonly getStatement;
-  private readonly insertStatement;
-  private readonly removeStatement;
-  private readonly deleteUserStatement;
-  private readonly deleteKeysStatement;
-  private readonly listStatement;
+  private readonly getStatement: StatementSync;
+  private readonly insertStatement: StatementSync;
+  private readonly removeStatement: StatementSync;
+  private readonly deleteUserStatement: StatementSync;
+  private readonly deleteKeysStatement: StatementSync;
+  private readonly listStatement: StatementSync;
+  /** Prepared `IN (?, ?, ...)` statements, cached by placeholder count. */
+  private readonly manyStatements = new Map<number, StatementSync>();
 
   constructor(filename = './data/wa-auth.sqlite') {
     const inMemory = filename === ':memory:';
@@ -80,22 +83,38 @@ export class SQLiteAuthStore implements AuthStore {
     );
   }
 
+  private assertOpen(): void {
+    if (this.closed) throw new Error('SQLiteAuthStore is closed.');
+  }
+
+  private manyStatement(count: number): StatementSync {
+    let statement = this.manyStatements.get(count);
+    if (!statement) {
+      const placeholders = Array.from({ length: count }, () => '?').join(', ');
+      statement = this.database.prepare(
+        `SELECT record_key, value FROM wa_auth WHERE user_id = ? AND record_key IN (${placeholders})`,
+      );
+      this.manyStatements.set(count, statement);
+    }
+    return statement;
+  }
+
   async get(userId: string, key: string): Promise<string | undefined> {
+    this.assertOpen();
     const row = this.getStatement.get(userId, key) as { value: string } | undefined;
     return row?.value;
   }
 
   async getMany(userId: string, keys: string[]): Promise<Map<string, string>> {
+    this.assertOpen();
     const result = new Map<string, string>();
     const CHUNK = 500; // stay below SQLite's bound-parameter limit
     for (let i = 0; i < keys.length; i += CHUNK) {
       const chunk = keys.slice(i, i + CHUNK);
-      const placeholders = chunk.map(() => '?').join(', ');
-      const rows = this.database
-        .prepare(
-          `SELECT record_key, value FROM wa_auth WHERE user_id = ? AND record_key IN (${placeholders})`,
-        )
-        .all(userId, ...chunk) as { record_key: string; value: string }[];
+      const rows = this.manyStatement(chunk.length).all(userId, ...chunk) as unknown as {
+        record_key: string;
+        value: string;
+      }[];
       for (const row of rows) result.set(row.record_key, row.value);
     }
     return result;
@@ -103,8 +122,9 @@ export class SQLiteAuthStore implements AuthStore {
 
   async setMany(userId: string, records: AuthRecord[]): Promise<void> {
     if (records.length === 0) return;
+    this.assertOpen();
     // Everything below is synchronous, so transactions of different callers never interleave.
-    this.database.exec('BEGIN');
+    this.database.exec('BEGIN IMMEDIATE');
     try {
       for (const record of dedupe(records)) {
         if (record.value === null) this.removeStatement.run(userId, record.key);
@@ -112,50 +132,87 @@ export class SQLiteAuthStore implements AuthStore {
       }
       this.database.exec('COMMIT');
     } catch (error) {
-      this.database.exec('ROLLBACK');
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        // transaction may already be gone; keep the original error
+      }
       throw error;
     }
   }
 
   async deleteUser(userId: string): Promise<void> {
+    this.assertOpen();
     this.deleteUserStatement.run(userId);
   }
 
   async deleteKeys(userId: string, prefix: string): Promise<void> {
+    this.assertOpen();
     this.deleteKeysStatement.run(userId, prefix.length, prefix);
   }
 
   async listUsers(): Promise<string[]> {
-    return (this.listStatement.all() as { user_id: string }[]).map((row) => row.user_id);
+    this.assertOpen();
+    return (this.listStatement.all() as unknown as { user_id: string }[]).map((row) => row.user_id);
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    try {
+      // Fold the WAL back into the main file so a plain file copy is complete.
+      this.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch {
+      // not fatal
+    }
     this.database.close();
   }
 }
 
+// ──────────────────────────────── PostgreSQL ────────────────────────────────
+
+export type PostgresOptions = {
+  /** Called for idle PostgreSQL pool errors. */
+  onError?: (error: Error) => void;
+  /** Max pool connections. Default: 10. */
+  poolMax?: number;
+};
+
 export class PostgresAuthStore implements AuthStore {
   private readonly pool: Pool;
-  private readonly initialization: Promise<void>;
+  private initialization: Promise<void> | undefined;
   private closed = false;
 
   constructor(
     connectionString: string,
-    onError: (error: Error) => void = (error) =>
-      logger.error('Idle PostgreSQL client error', 'DATABASE', error),
+    options: PostgresOptions = {},
   ) {
-    this.pool = new Pool({ connectionString });
+    const onError =
+      options.onError ??
+      ((error: Error) => logger.error('Idle PostgreSQL client error', 'DATABASE', error));
+    this.pool = new Pool({
+      connectionString,
+      max: options.poolMax ?? 10,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 10_000,
+    });
     // An unhandled 'error' event on an idle client would crash the whole process.
     this.pool.on('error', onError);
-    this.initialization = this.pool.query(CREATE_TABLE).then(() => undefined);
-    // Avoid an unhandledRejection if the DB is down at startup; ready() still rethrows.
-    this.initialization.catch(() => undefined);
+    // Warm up at startup; a failure here is retried on the next call (see ready()).
+    this.ready().catch(() => undefined);
   }
 
-  private async ready(): Promise<void> {
-    await this.initialization;
+  /** Creates the table once. If it failed (DB down), the next call tries again. */
+  private ready(): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('PostgresAuthStore is closed.'));
+    this.initialization ??= this.pool.query(CREATE_TABLE).then(
+      () => undefined,
+      (error: unknown) => {
+        this.initialization = undefined;
+        throw error;
+      },
+    );
+    return this.initialization;
   }
 
   async get(userId: string, key: string): Promise<string | undefined> {
@@ -168,8 +225,8 @@ export class PostgresAuthStore implements AuthStore {
   }
 
   async getMany(userId: string, keys: string[]): Promise<Map<string, string>> {
-    await this.ready();
     if (keys.length === 0) return new Map();
+    await this.ready();
     const result = await this.pool.query<{ record_key: string; value: string }>(
       'SELECT record_key, value FROM wa_auth WHERE user_id = $1 AND record_key = ANY($2::text[])',
       [userId, keys],
@@ -241,137 +298,28 @@ export class PostgresAuthStore implements AuthStore {
   }
 }
 
-const ENCRYPTED_PREFIX = 'enc:v1:';
+// ───────────────────────────────── factory ─────────────────────────────────
 
-function parseKey(key: string | Buffer): Buffer {
-  if (Buffer.isBuffer(key)) {
-    if (key.length !== 32) throw new Error('Encryption key must be exactly 32 bytes.');
-    return Buffer.from(key);
-  }
-  const candidates = [
-    /^[0-9a-fA-F]{64}$/.test(key) ? Buffer.from(key, 'hex') : undefined,
-    Buffer.from(key, 'base64'),
-  ];
-  const found = candidates.find((candidate) => candidate?.length === 32);
-  if (!found) {
-    throw new Error('Encryption key must be 32 bytes, given as 64 hex chars or base64.');
-  }
-  return found;
-}
+export type CreateAuthStoreOptions = PostgresOptions;
 
 /**
- * Decorator that encrypts every value at rest with AES-256-GCM.
- * The (userId, key) pair is bound as AAD, so a ciphertext copied to another row will not decrypt.
- * Generate a key with:  node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+ * No URL                      -> SQLite at ./data/wa-auth.sqlite
+ * sqlite::memory:             -> in-memory SQLite (tests)
+ * sqlite://./path/file.sqlite -> SQLite at that path (sqlite:///abs/path for absolute)
+ * postgres:// | postgresql:// -> PostgreSQL (Supabase etc.)
  */
-export class EncryptedAuthStore implements AuthStore {
-  private readonly key: Buffer;
-
-  constructor(
-    private readonly inner: AuthStore,
-    key: string | Buffer,
-    private readonly allowPlaintext = true,
-  ) {
-    this.key = parseKey(key);
-  }
-
-  private encrypt(userId: string, recordKey: string, plain: string): string {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', this.key, iv);
-    cipher.setAAD(Buffer.from(`${userId}\0${recordKey}`));
-    const body = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
-    return ENCRYPTED_PREFIX + Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64');
-  }
-
-  private decrypt(userId: string, recordKey: string, stored: string): string {
-    if (!stored.startsWith(ENCRYPTED_PREFIX)) {
-      if (this.allowPlaintext) return stored; // legacy row written before encryption was enabled
-      throw new Error(`Unencrypted record found for "${userId}" while plaintext is not allowed.`);
-    }
-    const raw = Buffer.from(stored.slice(ENCRYPTED_PREFIX.length), 'base64');
-    const decipher = createDecipheriv('aes-256-gcm', this.key, raw.subarray(0, 12));
-    decipher.setAAD(Buffer.from(`${userId}\0${recordKey}`));
-    decipher.setAuthTag(raw.subarray(12, 28));
-    return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
-  }
-
-  async get(userId: string, key: string): Promise<string | undefined> {
-    const stored = await this.inner.get(userId, key);
-    return stored === undefined ? undefined : this.decrypt(userId, key, stored);
-  }
-
-  async getMany(userId: string, keys: string[]): Promise<Map<string, string>> {
-    const stored = this.inner.getMany
-      ? await this.inner.getMany(userId, keys)
-      : new Map(
-          (
-            await Promise.all(
-              keys.map(async (key) => [key, await this.inner.get(userId, key)] as const),
-            )
-          ).filter((entry): entry is readonly [string, string] => entry[1] !== undefined),
-        );
-    return new Map([...stored].map(([key, value]) => [key, this.decrypt(userId, key, value)]));
-  }
-
-  setMany(userId: string, records: AuthRecord[]): Promise<void> {
-    return this.inner.setMany(
-      userId,
-      records.map((record) => ({
-        key: record.key,
-        value: record.value === null ? null : this.encrypt(userId, record.key, record.value),
-      })),
-    );
-  }
-
-  deleteKeys(userId: string, prefix: string): Promise<void> {
-    return this.inner.deleteKeys(userId, prefix);
-  }
-
-  deleteUser(userId: string): Promise<void> {
-    return this.inner.deleteUser(userId);
-  }
-
-  listUsers(): Promise<string[]> {
-    return this.inner.listUsers();
-  }
-
-  close(): Promise<void> {
-    return this.inner.close();
-  }
-}
-
-export type CreateAuthStoreOptions = {
-  /** 32-byte key (64 hex chars or base64). When set, all values are encrypted at rest. */
-  encryptionKey?: string | Buffer;
-  /** Refuse to read unencrypted rows (use after you finished migrating). Default: false. */
-  requireEncrypted?: boolean;
-  /** Called for idle PostgreSQL pool errors. */
-  onError?: (error: Error) => void;
-};
-
 export function createAuthStore(
   databaseUrl?: string,
   options: CreateAuthStoreOptions = {},
 ): AuthStore {
-  if (options.requireEncrypted && !options.encryptionKey) {
-    throw new Error('requireEncrypted requires an encryptionKey.');
+  const url = databaseUrl?.trim();
+  if (!url) return new SQLiteAuthStore();
+  if (url.startsWith('postgres://') || url.startsWith('postgresql://')) {
+    return new PostgresAuthStore(url, options);
   }
-  const encryptionKey = options.encryptionKey ? parseKey(options.encryptionKey) : undefined;
-
-  let store: AuthStore;
-  if (!databaseUrl) {
-    store = new SQLiteAuthStore();
-  } else if (databaseUrl.startsWith('postgres://') || databaseUrl.startsWith('postgresql://')) {
-    store = new PostgresAuthStore(databaseUrl, options.onError);
-  } else if (databaseUrl === 'sqlite::memory:') {
-    store = new SQLiteAuthStore(':memory:');
-  } else if (databaseUrl.startsWith('sqlite://')) {
-    // sqlite:///abs/path -> /abs/path   |   sqlite://./rel/path -> ./rel/path
-    store = new SQLiteAuthStore(decodeURIComponent(databaseUrl.slice('sqlite://'.length)));
-  } else {
-    throw new Error('Unsupported database URL. Use sqlite://, postgres://, or postgresql://.');
+  if (url === 'sqlite::memory:') return new SQLiteAuthStore(':memory:');
+  if (url.startsWith('sqlite://')) {
+    return new SQLiteAuthStore(decodeURIComponent(url.slice('sqlite://'.length)));
   }
-  return encryptionKey
-    ? new EncryptedAuthStore(store, encryptionKey, !options.requireEncrypted)
-    : store;
+  throw new Error('Unsupported database URL. Use sqlite://, postgres://, or postgresql://.');
 }

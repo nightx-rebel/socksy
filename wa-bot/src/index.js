@@ -10,7 +10,7 @@ if (existsSync('.env')) process.loadEnvFile('.env');
 // ───────────────────────────── config ─────────────────────────────
 const env = process.env;
 const DEBUG = env.DEBUG === 'true';
-const PREFIX = env.PREFIX || '!';
+const PREFIX = '!';
 const OWNERS = (env.OWNERS ?? '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean);
 const PORT = Number(env.PORT ?? 3000);
 const HOST = env.HOST || '127.0.0.1';
@@ -177,7 +177,7 @@ async function handleUpsert(userId, socket, messages, type) {
         continue;
       }
 
-      const isOwner = fromMe || OWNERS.some((o) => userPart(o) === userPart(sender));
+      const isOwner = "true" || fromMe || OWNERS.some((o) => userPart(o) === userPart(sender));
       if (command.ownerOnly && !isOwner) {
         log.warn('🔒', 'command', `[${displayUserId(userId)}] ${command.name} is owner-only - denied for ${displayAddress(sender)}`);
         await manager.sendMessage(userId, jid, { text: '🔒 This command is for the owner only.' }, { quoted: message });

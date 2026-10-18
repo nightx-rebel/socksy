@@ -8,23 +8,25 @@ import {
   type SignalKeyStore,
 } from '@whiskeysockets/baileys';
 import type { AuthStore } from './auth-store.js';
+import logger from './logger.js';
 
 type JsonRecord = Record<string, unknown>;
 const isRecord = (value: unknown): value is JsonRecord =>
   value !== null && typeof value === 'object';
 
-/** JSON with binary support. Bytes are stored as base64 (much smaller than number arrays). */
+/**
+ * JSON with binary support. Bytes are stored as base64 (much smaller than number arrays).
+ * The replacer reads the RAW value via `this[key]`, because JSON.stringify calls
+ * Buffer#toJSON first and would otherwise turn every Buffer into a huge number array.
+ */
 export function serialize(value: unknown): string {
-  return JSON.stringify(value, (_key, current: unknown) => {
-    if (current instanceof Uint8Array) {
+  return JSON.stringify(value, function (this: Record<string, unknown>, key: string, current: unknown) {
+    const raw = this[key];
+    if (raw instanceof Uint8Array) {
       return {
-        __waB64: Buffer.from(current.buffer, current.byteOffset, current.byteLength).toString('base64'),
-        __waBuffer: Buffer.isBuffer(current),
+        __waB64: Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString('base64'),
+        __waBuffer: Buffer.isBuffer(raw),
       };
-    }
-    // Buffer#toJSON runs before the replacer, so Buffers arrive in this shape.
-    if (isRecord(current) && current.type === 'Buffer' && Array.isArray(current.data)) {
-      return { __waB64: Buffer.from(current.data as number[]).toString('base64'), __waBuffer: true };
     }
     return current;
   });
@@ -60,6 +62,13 @@ export function isPaired(creds: Partial<AuthenticationCreds>): boolean {
   return creds.registered === true || Boolean(creds.me?.id && creds.account);
 }
 
+/** Stops a half-empty creds object from silently being used (would break the session). */
+function assertCredsShape(creds: Partial<AuthenticationCreds>, userId: string): void {
+  if (!creds.noiseKey || !creds.signedIdentityKey || !creds.signedPreKey) {
+    throw new Error(`Saved credentials for "${userId}" are incomplete or corrupted.`);
+  }
+}
+
 export async function readCreds(
   store: AuthStore,
   userId: string,
@@ -73,38 +82,51 @@ export async function isUserPairedInStore(store: AuthStore, userId: string): Pro
   return creds !== undefined && isPaired(creds);
 }
 
+async function readMany(
+  store: AuthStore,
+  userId: string,
+  recordKeys: string[],
+): Promise<Map<string, string>> {
+  if (store.getMany) return store.getMany(userId, recordKeys);
+  const entries = await Promise.all(
+    recordKeys.map(async (key) => [key, await store.get(userId, key)] as const),
+  );
+  return new Map(entries.filter((e): e is readonly [string, string] => e[1] !== undefined));
+}
+
 export async function loadAuthState(
   store: AuthStore,
   userId: string,
 ): Promise<AuthenticationState> {
   const saved = await readCreds(store, userId);
+  if (saved) assertCredsShape(saved, userId);
   const creds = saved ?? initAuthCreds();
   if (!saved) await store.setMany(userId, [{ key: 'creds', value: serialize(creds) }]);
 
   const keys: SignalKeyStore = {
     get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
-      const recordKeys = ids.map((id) => `key:${type}:${id}`);
-      const stored = store.getMany
-        ? await store.getMany(userId, recordKeys)
-        : new Map(
-            (
-              await Promise.all(
-                recordKeys.map(async (key) => [key, await store.get(userId, key)] as const),
-              )
-            ).filter((entry): entry is readonly [string, string] => entry[1] !== undefined),
-          );
       const result: { [id: string]: SignalDataTypeMap[T] } = {};
+      if (ids.length === 0) return result;
+
+      const recordKeys = ids.map((id) => `key:${type}:${id}`);
+      const stored = await readMany(store, userId, recordKeys);
+
       ids.forEach((id, index) => {
         const raw = stored.get(recordKeys[index]!);
         if (raw === undefined) return;
-        let value = deserialize<SignalDataTypeMap[T]>(raw);
-        // Baileys expects a protobuf instance here (same as useMultiFileAuthState).
-        if (type === 'app-state-sync-key' && value) {
-          value = proto.Message.AppStateSyncKeyData.fromObject(
-            value as object,
-          ) as unknown as SignalDataTypeMap[T];
+        try {
+          let value = deserialize<SignalDataTypeMap[T]>(raw);
+          // Baileys expects a protobuf instance here (same as useMultiFileAuthState).
+          if (type === 'app-state-sync-key' && value) {
+            value = proto.Message.AppStateSyncKeyData.fromObject(
+              value as object,
+            ) as unknown as SignalDataTypeMap[T];
+          }
+          result[id] = value;
+        } catch {
+          // One unreadable key must not break the whole batch; Baileys treats it as missing.
+          logger.warn(`Skipping unreadable key ${type}:${id}`, userId);
         }
-        result[id] = value;
       });
       return result;
     },

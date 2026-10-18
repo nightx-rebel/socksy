@@ -1,6 +1,5 @@
 export {
   createAuthStore,
-  EncryptedAuthStore,
   PostgresAuthStore,
   SQLiteAuthStore,
   type CreateAuthStoreOptions,
