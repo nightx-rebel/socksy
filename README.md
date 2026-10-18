@@ -929,6 +929,7 @@ for (const name of [
 
 ```sh
 npm install
+npm install --prefix test
 npm run typecheck
 npm test
 ```

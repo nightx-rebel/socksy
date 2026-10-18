@@ -8,11 +8,12 @@ Requires Node.js 22.13 or newer. From the repository root:
 
 ```sh
 npm ci
+npm ci --prefix test
 npm run build
-cd wa-bot
-npm ci
-cp .env.example .env
 ```
+
+Run the full build and starter test suite from the repository root with `npm test`.
+To run the starter bot, copy `test/.env.example` to `test/.env`, then run `npm start` from `test/`.
 
 Set `BOT_API_TOKEN` in `.env` to a long random secret. `API_KEY` is also accepted. Generate one with:
 
@@ -26,7 +27,7 @@ Then start the bot from `wa-bot`:
 npm start
 ```
 
-The default host is `127.0.0.1`. If binding to a non-loopback address, configure an API key; startup fails without one. Keep the API private and use HTTPS when accessing it remotely.
+The default host is `127.0.0.1`. If binding to a non-loopback address, configure an API key; startup fails without one. Set a key whenever a reverse proxy, tunnel, or other remote access path is used. Keep the API private and use HTTPS when accessing it remotely.
 
 ## Pair an account
 
@@ -44,7 +45,7 @@ The pairing endpoint is rate limited and its responses are marked `Cache-Control
 
 ## API
 
-All routes except `/health` require the configured API key:
+When an API key is configured, all routes except `/health` require it:
 
 - `GET|POST /pair?number=<international number>[&userId=<id>]`
 - `GET /users` and `GET /users/:userId`
@@ -55,14 +56,14 @@ All routes except `/health` require the configured API key:
 - `POST /send` with `{ "userId": "...", "to": "...", "text": "..." }`
 - `GET /health`
 
-The API key can be sent as `Authorization: Bearer <token>` or `x-api-key: <token>`. The health endpoint confirms that the API is running, not that WhatsApp is connected.
+The API key can be sent as `Authorization: Bearer <token>` or `x-api-key: <token>`. It is optional when binding to loopback, but set one whenever a reverse proxy, tunnel, or other remote access path is used. The health endpoint confirms that the API is running, not that WhatsApp is connected.
 
 ## Auth storage and operations
 
-The default database is local SQLite at `wa-bot/data/wa-auth.sqlite`; startup fails if the library cannot restrict the database file to its owner. For a shared production database, set `DATABASE_URL` to a PostgreSQL connection URL. Optionally set `AUTH_ENCRYPTION_KEY` to a 32-byte key (64 hex characters or base64) to encrypt auth values at rest. Existing plaintext rows must be rewritten before enabling strict encrypted-only reads. Keep database backups and encryption keys private. Never commit the database, `.env`, pairing codes, or auth credentials.
+The default database is local SQLite at `test/data/wa-auth.sqlite`; startup fails if the library cannot restrict the database file to its owner. For a shared production database, set `DATABASE_URL` to a PostgreSQL connection URL. Auth values are stored in plaintext; restrict database access and keep database backups private. Never commit the database, `.env`, pairing codes, or auth credentials.
 
 `MAX_CONCURRENT_CONNECTIONS` limits simultaneous connection handshakes, not the number of accounts the host can sustain. Hundreds of persistent sessions require load testing against host memory, file descriptors, network, database, and reconnect behavior. Do not run two bot processes against the same account IDs without distributed session ownership/locking.
 
 Messages are not written to logs by default. Set `DEBUG=true` only when needed; debug previews may contain message text.
 
-Run the tests from the repository root with `npm test`, or from this folder with `npm test`.
+Run tests from the repository root with `npm test`, or from this folder with `npm test` after installing its dependencies.

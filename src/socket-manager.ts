@@ -332,7 +332,9 @@ export class MultiSocketManager {
       throw error;
     }
     if (!phone || this.isUserPaired(userId)) return { socket };
-    const { socket: finalSocket, code } = await this.pairWithRetry(userId, phone, customCode);
+    const { socket: finalSocket, code } = await this.track(
+      this.pairWithRetry(userId, phone, customCode),
+    );
     return { socket: finalSocket, pairingCode: code };
   }
 
@@ -348,7 +350,7 @@ export class MultiSocketManager {
     if (this.isUserPaired(userId)) {
       throw new WaManagerError('ALREADY_PAIRED', `User "${userId}" is already paired.`);
     }
-    return (await this.pairWithRetry(userId, phone, custom)).code;
+    return (await this.track(this.pairWithRetry(userId, phone, custom))).code;
   }
 
   getSocket(userId: string): WASocket | undefined {
@@ -802,6 +804,9 @@ export class MultiSocketManager {
             throw new WaManagerError('ALREADY_PAIRED', `User "${userId}" is already paired.`);
           }
           const code = await this.requestPairingCodeForSocket(userId, socket, phone, customCode);
+          if (operation.cancelled) {
+            throw new WaManagerError('NOT_AVAILABLE', `Pairing was cancelled for user "${userId}".`);
+          }
           return { socket, code };
         } catch (error) {
           lastError = error;
@@ -957,12 +962,17 @@ export class MultiSocketManager {
     this.closing = true;
     this.connectionLimiter.close();
     this.pairingLimiter.close();
+    for (const operation of this.pairingOperations.values()) operation.cancelled = true;
     for (const timer of this.reconnectTimers.values()) clearTimeout(timer);
     this.reconnectTimers.clear();
 
-    await this.settleAll();
-    await Promise.all([...this.sockets.keys()].map((userId) => this.stopUser(userId, false)));
-    await this.settleAll(); // wait for disconnect handlers still touching the store
+    const userIds = new Set([
+      ...this.sockets.keys(),
+      ...this.pending.keys(),
+      ...this.pairingOperations.keys(),
+    ]);
+    await Promise.all([...userIds].map((userId) => this.stopUser(userId, false)));
+    await this.settleAll(); // wait for pairing and disconnect handlers still touching the store
     await this.options.authStore.close();
   }
 

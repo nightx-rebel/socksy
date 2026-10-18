@@ -418,6 +418,13 @@ export function createServer({ manager, apiKey, pairingWindowMs }) {
       });
     }
 
+    if (error?.type === 'entity.too.large') {
+      return res.status(413).json({
+        ok: false,
+        error: 'payload_too_large',
+      });
+    }
+
     if (error instanceof WaManagerError) {
       const status = STATUS_BY_CODE[error.code] ?? 500;
 

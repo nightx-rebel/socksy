@@ -181,3 +181,14 @@ test('does not expose unexpected internal error details', async () => {
   assert.equal(response.body.message, 'Internal server error.');
   assert.doesNotMatch(JSON.stringify(response.body), /private internal detail/);
 });
+
+test('rejects oversized JSON requests with a client error', async () => {
+  const { app } = makeApp();
+  const response = await request(app)
+    .post('/send')
+    .set('x-api-key', token)
+    .send({ userId: 'user-1', to: '15551234567', text: 'x'.repeat(11_000) });
+
+  assert.equal(response.status, 413);
+  assert.deepEqual(response.body, { ok: false, error: 'payload_too_large' });
+});

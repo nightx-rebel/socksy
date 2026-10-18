@@ -2,21 +2,23 @@ import { getContentType, normalizeMessageContent } from '@whiskeysockets/baileys
 import { existsSync } from 'node:fs';
 import { createAuthStore, DisconnectReason, MultiSocketManager, WaManagerError } from 'wa-multi-socket';
 import { commandMap } from './commands.js';
-import { isDebug, log, setDebug } from './logger.js';
+import { isDebug, log, setDebug, setPrefix } from './logger.js';
 import { assertSecureHost, createServer } from './server.js';
+import { isOwnerMessage } from './authorization.js';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
 
 // ───────────────────────────── config ─────────────────────────────
 const env = process.env;
 const DEBUG = env.DEBUG === 'true';
-const PREFIX = '!';
+const PREFIX = env.PREFIX || '!';
 const OWNERS = (env.OWNERS ?? '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean);
 const PORT = Number(env.PORT ?? 3000);
 const HOST = env.HOST || '127.0.0.1';
 const API_KEY = env.API_KEY || env.BOT_API_TOKEN || undefined;
 const PAIRING_WINDOW_MS = 180_000;
 setDebug(DEBUG);
+setPrefix(PREFIX);
 assertSecureHost(HOST, API_KEY);
 
 const reasonName = (reason) => {
@@ -24,7 +26,6 @@ const reasonName = (reason) => {
   const name = Object.keys(DisconnectReason).find((key) => DisconnectReason[key] === reason);
   return `${name ?? 'unknown'} (${reason})`;
 };
-const userPart = (jid) => jid.split('@')[0].split(':')[0];
 const maskCode = (code) => (code ? `${String(code).slice(0, 2)}******` : '');
 const displayUserId = (userId) => {
   const match = String(userId).match(/^(user-)?(\d{7,15})$/);
@@ -43,7 +44,6 @@ const displayAddress = (address) => {
 // Baileys' own logger is configured inside wa-multi-socket (LOG_LEVEL env).
 const manager = new MultiSocketManager({
   authStore: createAuthStore(env.DATABASE_URL || undefined, {
-    encryptionKey: env.AUTH_ENCRYPTION_KEY || undefined,
     onError: (error) => log.error('🗄️', 'database', 'PostgreSQL pool error', error),
   }),
   socketConfig: {
@@ -177,7 +177,7 @@ async function handleUpsert(userId, socket, messages, type) {
         continue;
       }
 
-      const isOwner = "true" || fromMe || OWNERS.some((o) => userPart(o) === userPart(sender));
+      const isOwner = isOwnerMessage(fromMe, sender, OWNERS);
       if (command.ownerOnly && !isOwner) {
         log.warn('🔒', 'command', `[${displayUserId(userId)}] ${command.name} is owner-only - denied for ${displayAddress(sender)}`);
         await manager.sendMessage(userId, jid, { text: '🔒 This command is for the owner only.' }, { quoted: message });
