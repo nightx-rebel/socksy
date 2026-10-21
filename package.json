@@ -1,7 +1,19 @@
 {
-  "name": "wa-multi-socket",
+  "name": "socksy",
   "version": "1.0.0",
   "description": "Multi-user WhatsApp socket manager for Baileys with SQL-backed auth state.",
+  "keywords": [
+    "multi-session"
+  ],
+  "homepage": "https://github.com/nightx-rebel/socksy#readme",
+  "bugs": {
+    "url": "https://github.com/nightx-rebel/socksy/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nightx-rebel/socksy.git"
+  },
+  "author": "nightx-rebel",
   "license": "MIT",
   "type": "module",
   "engines": {
