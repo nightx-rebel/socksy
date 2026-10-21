@@ -7,7 +7,7 @@
 <h2 align="center">One manager. Multiple WhatsApp sessions. Your bot logic, your sockets.</h2>
 
 <p align="center">
-  <strong>A lightweight multi-user WhatsApp connection manager powered by the official Baileys library.</strong>
+  <strong>A lightweight multi-user WhatsApp connection manager powered by Baileys.</strong>
 </p>
 
 <p align="center">
@@ -20,6 +20,7 @@
 <p align="center">
   <a href="https://github.com/nightx-rebel/socksy">Repository</a> ·
   <a href="#-quick-start">Quick start</a> ·
+  <a href="#-included-bot-starter">Bot starter</a> ·
   <a href="#-configuration">Configuration</a> ·
   <a href="#-manager-api">Manager API</a>
 </p>
@@ -33,7 +34,7 @@ Socksy runs **multiple WhatsApp accounts from one Node.js application** using Ba
 You write the bot logic. Socksy manages the connections.
 
 > [!IMPORTANT]
-> **Requirements:** Node.js `22.13+` and an ESM project (`"type": "module"`). Session data is sensitive: anyone who gains access to your database file or database URL may be able to control the linked WhatsApp accounts. Keep it private and never commit it to Git.
+> **Requirements:** Node.js `22.13+` and an ESM project (`"type": "module"`). Auth credentials and Signal keys are stored unencrypted; anyone who gains access to the database file or database URL may be able to control linked WhatsApp accounts. Restrict access and never commit them to Git.
 
 ## 🧭 Contents
 
@@ -41,6 +42,7 @@ You write the bot logic. Socksy manages the connections.
 - [📦 Installation](#-installation)
 - [🚀 Quick start](#-quick-start)
 - [🤖 Use Socksy in your bot](#-use-socksy-in-your-bot)
+- [🧪 Included bot starter](#-included-bot-starter)
 - [⚙️ Configuration](#️-configuration)
 - [🧩 Socket configuration](#-socket-configuration)
 - [👥 Multiple users](#-multiple-users)
@@ -118,7 +120,7 @@ cd socksy
 npm install
 ```
 
-Set `"type": "module"` in your bot project's `package.json`, or use `.mjs` files. Baileys, Boom, and the PostgreSQL driver are installed as project dependencies.
+Set `"type": "module"` in your bot project's `package.json`, or use `.mjs` files. Socksy's runtime dependencies (Baileys, Boom, PostgreSQL driver, and logging packages) are installed with the package.
 
 Check your Node.js version (including on Termux):
 
@@ -126,15 +128,12 @@ Check your Node.js version (including on Termux):
 node -v   # requires v22.13.0 or newer
 ```
 
-> [!NOTE]
-> Example imports below use `wa-multi-socket`, the package name currently shown in the source snippets. If you also change the package's `package.json` name to `socksy`, update those imports to `socksy` too.
-
 ## 🚀 Quick start
 
 This minimal example restores saved accounts, listens for messages, and replies to `!ping`.
 
 ```ts
-import { createAuthStore, MultiSocketManager } from 'wa-multi-socket';
+import { createAuthStore, MultiSocketManager } from 'socksy';
 
 // Create one manager for the whole application.
 const manager = new MultiSocketManager({
@@ -217,7 +216,7 @@ my-bot/
 ### `src/whatsapp.ts` — shared manager
 
 ```ts
-import { createAuthStore, MultiSocketManager } from 'wa-multi-socket';
+import { createAuthStore, MultiSocketManager } from 'socksy';
 
 export const whatsapp = new MultiSocketManager({
   authStore: createAuthStore(process.env.DATABASE_URL),
@@ -424,6 +423,8 @@ const manager = new MultiSocketManager({
 | Pairing codes expire too soon | Review `pairingTimeoutMs`. |
 | High RAM usage | Disable full history sync and reduce simultaneous connection attempts. |
 
+Connection limits are tuning controls, not account-capacity guarantees. Measure memory, network, file descriptors, database load, and message volume on your own host before choosing a deployment size.
+
 Message spacing may reduce bursts, but **cannot guarantee that an account will never be limited or banned**.
 
 ## 🧩 Socket configuration
@@ -599,7 +600,7 @@ Socksy retries temporary failures automatically. Login data is retained for disc
 Customize delays using exported Baileys disconnect reasons:
 
 ```ts
-import { DisconnectReason } from 'wa-multi-socket';
+import { DisconnectReason } from 'socksy';
 
 const manager = new MultiSocketManager({
   authStore: createAuthStore(),
@@ -669,6 +670,31 @@ Sessions are not migrated automatically between SQLite and PostgreSQL. After swi
 
 ## 🧰 Manager API
 
+### Public package exports
+
+Import the library from `socksy` (the package name in `package.json`). The public entry point exports:
+
+| Export | Use |
+|---|---|
+| `MultiSocketManager` | Manage sockets, pairing, reconnects, events, and queued sends. |
+| `createAuthStore` | Create a SQLite or PostgreSQL auth store from a URL. |
+| `SQLiteAuthStore`, `PostgresAuthStore` | Construct a built-in store directly. |
+| `WaManagerError`, `WaManagerErrorCode` | Inspect manager errors and their stable codes. |
+| `DisconnectReason` | Use Baileys disconnect reason constants in reconnect settings. |
+| `isPaired` | Check whether Baileys credentials represent a linked account. |
+| `WASocket`, `AuthRecord`, `AuthStore` | TypeScript types for sockets and auth-store implementations. |
+| `CreateAuthStoreOptions` | PostgreSQL pool options accepted by `createAuthStore`. |
+| `AddUserOptions`, `AddUserResult`, `ManagerStats`, `MultiSocketManagerOptions`, `SocketConfig`, `SocketFactory`, `UserStatus` | Manager API and configuration types. |
+
+For example, import runtime values and types like this:
+
+```ts
+import { createAuthStore, DisconnectReason, MultiSocketManager, WaManagerError } from 'socksy';
+import type { AuthStore, MultiSocketManagerOptions, WASocket } from 'socksy';
+```
+
+The internal modules (`auth-state`, `send-scheduler`, `session-store`, and `logger`) are not public package entry points.
+
 ### Start and add users
 
 | Method | Purpose |
@@ -708,7 +734,7 @@ A queued message is not replayed after a later reconnection. Once WhatsApp repor
 Manager errors are instances of `WaManagerError` and expose stable error codes.
 
 ```ts
-import { WaManagerError } from 'wa-multi-socket';
+import { WaManagerError } from 'socksy';
 
 try {
   await manager.sendMessage(userId, jid, { text: 'Hello' });
@@ -789,6 +815,83 @@ await manager.disconnectUser('tenant-a'); // Pause; keep saved login.
 await manager.connectUser('tenant-a'); // Reconnect later.
 ```
 
+## 🧪 Included bot starter
+
+The [`test/`](test/) directory is also a runnable JavaScript + Express example, not just a test fixture. It demonstrates owner-only commands, pairing over HTTP, account management, queued text sending, status reporting, and safe shutdown. Its local dependency is named `wa-multi-socket` as an npm alias for the repository checkout; applications consuming the package should import it as `socksy`.
+
+### Install and run the starter
+
+From the repository root, install the library first so its `dist/` files are built, then install the starter dependencies:
+
+```sh
+npm ci
+npm ci --prefix test
+cp test/.env.example test/.env
+cd test
+npm start
+```
+
+The default server binds to `127.0.0.1:3000` and stores auth in `test/data/wa-auth.sqlite` (relative to the starter's working directory). Set `API_KEY` in `test/.env` for authenticated API requests. You can generate a token with:
+
+```sh
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+
+`BOT_API_TOKEN` is accepted as an alternative to `API_KEY`. The server refuses to bind to a non-loopback `HOST` without an API key. Configure a key even on loopback if a reverse proxy, tunnel, or other remote access is possible. `/health` is intentionally public; every other route requires the key when one is configured. Use HTTPS for remote access.
+
+The starter reads these settings from `test/.env`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | HTTP port. |
+| `HOST` | `127.0.0.1` | Bind address; non-loopback requires `API_KEY` or `BOT_API_TOKEN`. |
+| `API_KEY` / `BOT_API_TOKEN` | Unset | Protect the HTTP API. |
+| `DATABASE_URL` | `sqlite://./data/wa-auth.sqlite` | SQLite or PostgreSQL auth storage URL. |
+| `PREFIX` | `!` | Chat command prefix. |
+| `OWNERS` | Empty | Comma-separated owner phone numbers; messages sent by the linked account itself are also treated as owner messages. |
+| `DEBUG` | `false` | Enable verbose starter logs; message previews may include private text. |
+| `MAX_CONCURRENT_CONNECTIONS` | `20` | Maximum simultaneous socket handshakes. |
+| `MAX_CONCURRENT_PAIRINGS` | `5` | Maximum simultaneous pairing requests. |
+| `SEND_INTERVAL_MS` | `400` | Minimum delay between queued sends; the starter adds 100 ms of jitter. |
+
+Set `LOG_LEVEL` in the process environment before starting Node.js to change Socksy/Baileys logger verbosity (`trace`, `debug`, `info`, `warn`, `error`, `fatal`, or `silent`).
+
+### Pair and call the HTTP API
+
+Pair an account you own. Use the international phone number with country code; `+` and punctuation are accepted. The server accepts `phone` or `number`, and generates `user-<digits>` unless you provide `userId`.
+
+The app reads `API_KEY` from `test/.env`; your shell does not load that file automatically. Export the same token in the shell where you run `curl`:
+
+```sh
+export API_KEY='replace-with-the-token-from-test/.env'
+curl --get 'http://127.0.0.1:3000/pair' \
+  -H "x-api-key: $API_KEY" \
+  --data-urlencode 'phone=+1 555 123 4567'
+```
+
+Enter the returned code on the phone under WhatsApp → **Settings** → **Linked devices** → **Link a device** → **Link with phone number instead**. Pairing code responses are marked `Cache-Control: no-store`; the endpoint is limited to 10 requests per minute per client IP. Do not log pairing codes or API request URLs containing them.
+
+| Method and path | Behavior |
+|---|---|
+| `GET /health` | Public process uptime and manager statistics; it does not guarantee a WhatsApp connection. |
+| `GET /` | List available routes. |
+| `GET /pair?phone=...` or `POST /pair` | Request a pairing code; body/query accepts `phone` or `number` and optional `userId`. |
+| `GET /users` | List known accounts and their status with manager statistics. |
+| `GET /users/:userId` | Show one account's status and linked WhatsApp JID. |
+| `POST /users/:userId/connect` | Connect or reconnect a saved account. |
+| `POST /users/:userId/disconnect` | Close its socket but retain saved auth. |
+| `POST /users/:userId/logout` | Unlink the WhatsApp device and delete saved auth. |
+| `DELETE /users/:userId` | Close the socket and delete saved auth. |
+| `POST /send` | Send text through Socksy's per-account queue. JSON body: `{ "userId": "user-15551234567", "to": "15551234567", "text": "Hello" }`. `to` can be a phone number or JID. |
+
+Send the API key as `x-api-key: <token>` or `Authorization: Bearer <token>`. The pairing endpoint accepts `GET` and `POST`; other routes use the methods shown above. Errors return JSON, and unexpected internal errors do not expose their underlying details.
+
+### Included chat commands
+
+With the default `!` prefix, the starter includes `ping` (`p`), `help` (`menu`, `h`), `status`, `uptime`, `echo`, `time`, `info` (`whoami`, `id`), `react`, `groupinfo`, `raw`, `burst`, `users`, and `debug`. `raw`, `burst`, `users`, and `debug` are owner-only. The `raw` command can reveal message contents, so keep owner access restricted. Use `OWNERS` for owner phone numbers; the linked account's own messages are considered owner messages too.
+
+The starter ignores non-notification/history upserts and status broadcasts, deduplicates recently seen messages in memory, and attaches Baileys listeners again for every newly connected socket. Its logs mask phone-like IDs; message text previews are only logged with `DEBUG=true`.
+
 ## 🩺 Troubleshooting
 
 | Symptom | Likely cause / fix |
@@ -820,11 +923,13 @@ await manager.connectUser('tenant-a'); // Reconnect later.
 ## 🧪 Development
 
 ```sh
-npm install
-npm install --prefix test
+npm ci
+npm ci --prefix test
 npm run typecheck
 npm test
 ```
+
+`npm test` builds the TypeScript package and runs the JavaScript starter tests. Tests require both root dependencies and the dependencies under `test/` to be installed.
 
 Before opening a pull request, run the type checks and tests and describe the problem your change solves.
 
