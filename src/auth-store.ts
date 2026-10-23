@@ -195,6 +195,9 @@ export class PostgresAuthStore implements AuthStore {
       max: options.poolMax ?? 10,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,
+      ssl: {
+           rejectUnauthorized: false,
+           },
     });
     // An unhandled 'error' event on an idle client would crash the whole process.
     this.pool.on('error', onError);
