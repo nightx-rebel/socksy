@@ -1,7 +1,7 @@
 # Socksy
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/WhiskeySockets/Baileys/refs/heads/master/Media/logo.png" alt="Baileys logo" width="210">
+  <img src="https://i.ibb.co/svPs3Ffr/wa-multi-socket-social-preview-1280x640-1.png" alt="socksy logo" width="500">
 </p>
 
 <h2 align="center">One manager. Multiple WhatsApp sessions. Your bot logic, your sockets.</h2>
